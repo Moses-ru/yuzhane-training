@@ -424,7 +424,7 @@ route('GET', '/api/admin/users', 'admin', async ({ db }) => {
   return { users, blocks: blocks.map(b => pick(b, ['id', 'title', 'icon'])) };
 });
 
-route('GET', '/api/admin/users/:id', 'admin', async ({ db, params, isAdmin }) => {
+route('GET', '/api/admin/users/:id', 'admin', async ({ db, env, params, isAdmin }) => {
   const user = await db.first('SELECT * FROM users WHERE tg_id = ?', Number(params.id));
   if (!user) throw new HttpError(404, 'Сотрудник не найден');
   const statuses = await blockStatuses(db, user.tg_id);
@@ -433,7 +433,7 @@ route('GET', '/api/admin/users/:id', 'admin', async ({ db, params, isAdmin }) =>
     SELECT l.block_id, COUNT(*) AS n FROM lesson_views v JOIN lessons l ON l.id = v.lesson_id
     WHERE v.user_id = ? GROUP BY l.block_id`, user.tg_id)).map(r => [r.block_id, r.n]));
   return {
-    user, is_admin: await isAdmin(user.tg_id),
+    user, is_admin: await isAdmin(user.tg_id), is_owner: envAdminIds(env).includes(user.tg_id),
     blocks: statuses.map(s => ({
       id: s.block.id, title: s.block.title, icon: s.block.icon, status: s.status, best: s.best, attempts: s.attempts,
       lessons_total: lessonCounts[s.block.id] || 0, lessons_viewed: viewed[s.block.id] || 0

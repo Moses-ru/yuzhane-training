@@ -4,9 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title>Обучение Южане</title>
-<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet">
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <link rel="stylesheet" href="app.css">
+<!-- Иконки грузятся, не задерживая показ страницы -->
+<link rel="preload" href="vendor/fa/css/all.min.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
+<noscript><link rel="stylesheet" href="vendor/fa/css/all.min.css"></noscript>
+<script src="https://telegram.org/js/telegram-web-app.js" defer></script>
 </head>
 <body data-theme="dark">
 
@@ -100,7 +102,7 @@
   <button class="nav-item" data-screen="profileScreen"><i class="fas fa-user"></i><span>Профиль</span></button>
 </nav>
 
-<script src="config.js"></script>
-<script src="app.js"></script>
+<script src="config.js" defer></script>
+<script src="app.js" defer></script>
 </body>
 </html>

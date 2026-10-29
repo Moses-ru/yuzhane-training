@@ -499,6 +499,12 @@ pages.usersDetail = async id => {
             <button class="btn btn-primary" type="submit"><i class="fas fa-check"></i> Сохранить</button>
             <button class="btn btn-danger" type="button" id="resetBtn"><i class="fas fa-rotate-left"></i> Сбросить прогресс</button>
           </div>
+          <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--line)">
+            ${d.is_owner ? '<span class="muted small"><i class="fas fa-crown"></i> Владелец — полный доступ к кабинету</span>'
+              : d.is_admin ? '<button class="btn" type="button" id="adminToggle" data-on="1"><i class="fas fa-user-minus"></i> Убрать из менеджеров</button>'
+              : '<button class="btn btn-gold" type="button" id="adminToggle"><i class="fas fa-user-shield"></i> Сделать менеджером</button>'}
+            ${d.is_owner ? '' : '<div class="muted small" style="margin-top:8px">Менеджер видит все результаты и редактирует контент. Входит через «Войти через Telegram» на странице кабинета.</div>'}
+          </div>
         </form>
       </div>
     </div>
@@ -525,6 +531,16 @@ pages.usersDetail = async id => {
     try { await api(`/users/${u.tg_id}/progress`, { method: 'DELETE' }); toast('Прогресс сброшен'); router(); } catch (err) { fail(err); }
   };
   $$('[data-attempt]').forEach(tr => (tr.onclick = () => showAttempt(tr.dataset.attempt)));
+  if ($('#adminToggle')) $('#adminToggle').onclick = async e => {
+    const on = !!e.currentTarget.dataset.on;
+    if (on && !(await confirmDialog(`Убрать у <b>${esc(fullName(u))}</b> доступ к кабинету?`, 'Убрать'))) return;
+    try {
+      if (on) await api(`/admins/${u.tg_id}`, { method: 'DELETE' });
+      else await api('/admins', { method: 'POST', body: { tg_id: u.tg_id, name: u.position || '' } });
+      toast(on ? 'Доступ к кабинету убран' : `${fullName(u)} теперь менеджер`);
+      router();
+    } catch (err) { fail(err); }
+  };
 };
 
 async function showAttempt(id) {
@@ -979,3 +995,7 @@ pages.settings = async () => {
 };
 
 boot();
+
+if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  navigator.serviceWorker.register('../sw.js').catch(() => {});
+}
