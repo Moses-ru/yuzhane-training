@@ -1,0 +1,22 @@
+name = "yuzhane-api"
+main = "worker/src/index.js"
+compatibility_date = "2025-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# Адрес приложения на GitHub Pages (без слеша в конце)
+WEBAPP_URL = "https://moses-ru.github.io/yuzhane-training"
+# Telegram ID владельцев через запятую — всегда имеют доступ к кабинету
+ADMIN_IDS = ""
+
+# Токен бота задаётся командой (не храните его в репозитории!):
+#   npx wrangler secret put BOT_TOKEN
+
+[[d1_databases]]
+binding = "DB"
+database_name = "yuzhane"
+database_id = "d8920439-bdb5-4c29-8f73-ed94caf36e83"
+
+[[kv_namespaces]]
+binding = "IMAGES"
+id = "32d0c51f511443699b3e80071455450d"

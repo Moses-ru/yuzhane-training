@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Обучение Южане</title>
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="app.css">
+</head>
+<body data-theme="dark">
+
+<div class="loading" id="loading">
+  <div class="loading-icon"><i class="fas fa-graduation-cap"></i></div>
+  <div class="loading-text">Загрузка обучения...</div>
+  <div class="loading-error" id="loadingError"></div>
+</div>
+
+<header>
+  <div class="logo"><i class="fas fa-utensils"></i><span id="appTitle">Обучение</span></div>
+  <button class="btn-icon" id="themeToggle" aria-label="Сменить тему"><i class="fas fa-sun"></i></button>
+</header>
+
+<main class="main-container">
+  <section class="screen active" id="homeScreen">
+    <div class="hello" id="hello"></div>
+    <div class="card progress-card">
+      <div class="progress-header">
+        <span class="progress-title">Твой прогресс</span>
+        <span class="progress-percent" id="progressPercent">0%</span>
+      </div>
+      <div class="bar"><div class="bar-fill" id="progressBar"></div></div>
+      <div class="stats">
+        <div class="stat"><b id="statPassed">0</b><span>Пройдено</span></div>
+        <div class="stat"><b id="statTotal">0</b><span>Блоков</span></div>
+        <div class="stat"><b id="statAttempts">0</b><span>Попыток</span></div>
+        <div class="stat"><b id="statAvg">—</b><span>Средний</span></div>
+      </div>
+    </div>
+
+    <h2 class="section-title"><i class="fas fa-book"></i> Блоки обучения</h2>
+    <div class="chapters" id="chapters"></div>
+
+    <div id="certificateSection" hidden>
+      <h2 class="section-title"><i class="fas fa-trophy"></i> Достижения</h2>
+      <div id="certificate"></div>
+    </div>
+  </section>
+
+  <section class="screen" id="referencesScreen">
+    <h2 class="section-title"><i class="fas fa-search"></i> Справочники</h2>
+    <input type="search" class="search-box" id="refSearch" placeholder="Поиск: блюдо, вино, аллерген...">
+    <div class="chips" id="refChips"></div>
+    <div class="ref-results" id="refResults"></div>
+  </section>
+
+  <section class="screen" id="profileScreen">
+    <div class="card profile-card">
+      <div class="avatar" id="profileAvatar"><i class="fas fa-user"></i></div>
+      <div class="profile-name" id="profileName">Гость</div>
+      <div class="profile-sub" id="profileSub"></div>
+      <a class="btn btn-gold" id="adminLink" href="admin/" hidden><i class="fas fa-chart-line"></i> Кабинет менеджера</a>
+    </div>
+    <h2 class="section-title"><i class="fas fa-chart-bar"></i> Результаты по блокам</h2>
+    <div class="list" id="blockStats"></div>
+    <h2 class="section-title"><i class="fas fa-clock-rotate-left"></i> История попыток</h2>
+    <div class="list" id="history"></div>
+  </section>
+</main>
+
+<div class="overlay" id="lessonView">
+  <div class="overlay-header">
+    <button class="btn-icon" data-close><i class="fas fa-arrow-left"></i></button>
+    <div class="overlay-title" id="lessonTitle"></div>
+    <div style="width:40px"></div>
+  </div>
+  <div class="dots" id="lessonDots"></div>
+  <div class="overlay-content" id="lessonContent"></div>
+</div>
+
+<div class="overlay" id="testView">
+  <div class="overlay-header">
+    <button class="btn-icon" data-close><i class="fas fa-xmark"></i></button>
+    <div class="overlay-title">Тест</div>
+    <div class="overlay-counter" id="testCounter"></div>
+  </div>
+  <div class="bar thin"><div class="bar-fill" id="testBar"></div></div>
+  <div class="overlay-content" id="testContent"></div>
+</div>
+
+<nav class="bottom-nav">
+  <button class="nav-item active" data-screen="homeScreen"><i class="fas fa-house"></i><span>Главная</span></button>
+  <button class="nav-item" data-screen="referencesScreen"><i class="fas fa-book-open"></i><span>Справочники</span></button>
+  <button class="nav-item" data-screen="profileScreen"><i class="fas fa-user"></i><span>Профиль</span></button>
+</nav>
+
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
