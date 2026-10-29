@@ -7,7 +7,7 @@ compatibility_flags = ["nodejs_compat"]
 # Адрес приложения на GitHub Pages (без слеша в конце)
 WEBAPP_URL = "https://moses-ru.github.io/yuzhane-training"
 # Telegram ID владельцев через запятую — всегда имеют доступ к кабинету
-ADMIN_IDS = ""
+ADMIN_IDS = "819157955"
 
 # Токен бота задаётся командой (не храните его в репозитории!):
 #   npx wrangler secret put BOT_TOKEN
