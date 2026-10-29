@@ -197,6 +197,9 @@ header {
 .loading-error { color: var(--danger); margin-top: 18px; line-height: 1.5; }
 .loading-error .btn { margin-top: 14px; width: auto; display: inline-flex; padding: 10px 20px; }
 @keyframes pulse { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.1); opacity: .7; } }
+.login-box { max-width: 360px; margin-top: 8px; }
+.login-box p { color: var(--text-sec); line-height: 1.55; margin-bottom: 20px; }
+.login-widget { min-height: 48px; display: flex; justify-content: center; }
 
 /* certificate */
 .certificate {

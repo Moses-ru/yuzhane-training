@@ -21,14 +21,27 @@ function formatText(s) {
     .replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
 }
 
+// Внутри Telegram пользователя подтверждает initData, в браузере — токен после входа через Telegram
+const inTelegram = !!tg?.initData;
+const session = {
+  get: () => { try { return localStorage.getItem('user_token'); } catch { return null; } },
+  set: t => { try { t ? localStorage.setItem('user_token', t) : localStorage.removeItem('user_token'); } catch {} }
+};
+
 async function api(path, options = {}) {
+  const headers = { 'Content-Type': 'application/json', 'X-Telegram-Init-Data': tg?.initData || '' };
+  if (!inTelegram && session.get()) headers.Authorization = `Bearer ${session.get()}`;
   const res = await fetch(window.APP_CONFIG.API_URL + '/api' + path, {
     ...options,
-    headers: { 'Content-Type': 'application/json', 'X-Telegram-Init-Data': tg?.initData || '', ...options.headers },
+    headers: { ...headers, ...options.headers },
     body: options.body ? JSON.stringify(options.body) : undefined
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Ошибка ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(data.error || `Ошибка ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
   return data;
 }
 
@@ -243,6 +256,7 @@ function renderProfile() {
   $('profileSub').textContent = [user.position, user.username ? '@' + user.username : '', `ID ${user.tg_id}`].filter(Boolean).join(' · ');
   $('profileAvatar').innerHTML = user.photo_url ? `<img src="${esc(user.photo_url)}" alt="">` : '<i class="fas fa-user"></i>';
   $('adminLink').hidden = !isAdmin;
+  $('logoutBtn').hidden = inTelegram || !session.get();
 
   $('blockStats').innerHTML = blocks.map((b, i) => `
     <div class="item">
@@ -394,14 +408,58 @@ async function finishTest() {
 
 // ---------- init ----------
 
+function showLogin() {
+  $('loading').classList.remove('hidden');
+  document.querySelector('.loading-icon').style.animation = 'none';
+  document.querySelector('.loading-text').textContent = 'Обучение «Южане»';
+  $('loadingError').innerHTML = '';
+  $('loginBox').hidden = false;
+  if ($('loginWidget').childElementCount) return;
+  fetch(window.APP_CONFIG.API_URL + '/api/admin/config').then(r => r.json()).then(cfg => {
+    if (!cfg.bot_username) {
+      $('loginError').textContent = 'Бот ещё не настроен.';
+      return;
+    }
+    const s = document.createElement('script');
+    s.async = true;
+    s.src = 'https://telegram.org/js/telegram-widget.js?22';
+    s.dataset.telegramLogin = cfg.bot_username;
+    s.dataset.size = 'large';
+    s.dataset.radius = '12';
+    s.dataset.onauth = 'onTelegramAuth(user)';
+    $('loginWidget').appendChild(s);
+  }).catch(() => ($('loginError').textContent = 'Сервер недоступен, попробуйте позже.'));
+}
+
+window.onTelegramAuth = async user => {
+  $('loginError').textContent = '';
+  try {
+    const { token } = await api('/auth/telegram', { method: 'POST', body: user });
+    session.set(token);
+    $('loginBox').hidden = true;
+    document.querySelector('.loading-text').textContent = 'Загрузка обучения...';
+    await init();
+  } catch (e) {
+    $('loginError').textContent = e.message;
+  }
+};
+
+$('logoutBtn').onclick = () => {
+  session.set(null);
+  location.reload();
+};
+
 async function init() {
   try {
     state = await api('/app');
     render();
     $('loading').classList.add('hidden');
   } catch (e) {
-    const outside = !tg?.initData;
-    $('loadingError').innerHTML = `${esc(outside ? 'Откройте приложение через Telegram-бота.' : e.message)}
+    if (e.status === 401 && !inTelegram) {
+      session.set(null);
+      return showLogin();
+    }
+    $('loadingError').innerHTML = `${esc(e.message)}
       <br><button class="btn btn-primary" onclick="location.reload()"><i class="fas fa-rotate-right"></i> Попробовать снова</button>`;
   }
 }

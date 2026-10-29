@@ -329,6 +329,21 @@ route('POST', '/api/admin/auth/dev', null, async ({ env, secret }) => {
 
 route('GET', '/api/admin/me', 'admin', ({ admin }) => admin);
 
+// Вход сотрудника с компьютера (вне Telegram) через Telegram Login Widget
+const USER_SESSION_DAYS = 90;
+route('POST', '/api/auth/telegram', null, async ({ env, db, body, secret }) => {
+  const u = verifyLoginWidget(env.BOT_TOKEN, pick(body, ['id', 'first_name', 'last_name', 'username', 'photo_url', 'auth_date', 'hash']));
+  if (!u) throw new HttpError(401, 'Не удалось проверить вход через Telegram');
+  await upsertUser(db, u);
+  return {
+    token: sign(secret, {
+      kind: 'user',
+      u: pick(u, ['id', 'first_name', 'last_name', 'username', 'photo_url']),
+      exp: Date.now() + USER_SESSION_DAYS * 86400e3
+    })
+  };
+});
+
 // --- кабинет: статистика и результаты ---
 
 route('GET', '/api/admin/stats', 'admin', async ({ db }) => {
@@ -756,18 +771,23 @@ async function handle(request, env, ctx) {
   const type = request.headers.get('Content-Type') || '';
   if (request.method !== 'GET' && type.includes('application/json')) c.body = await request.json().catch(() => ({}));
 
+  const bearer = (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '');
   if (r.auth === 'user') {
     let tgUser = verifyWebAppInitData(env.BOT_TOKEN, request.headers.get('X-Telegram-Init-Data'));
+    if (!tgUser && bearer) {
+      const session = unsign(secret, bearer);
+      if (session?.kind === 'user') tgUser = session.u;
+    }
     if (!tgUser && env.DEV_MODE === '1') {
       tgUser = { id: 100001, first_name: 'Тестовый', last_name: 'Сотрудник', username: 'test_user' };
       try { const d = request.headers.get('X-Dev-User'); if (d) tgUser = JSON.parse(d); } catch {}
     }
-    if (!tgUser) throw new HttpError(401, 'Откройте приложение через Telegram-бота');
+    if (!tgUser) throw new HttpError(401, 'Войдите через Telegram');
     c.user = await upsertUser(db, tgUser);
   } else if (r.auth === 'admin') {
-    const token = (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '');
-    const session = unsign(secret, token);
-    if (!session || !((await isAdmin(session.id)) || (env.DEV_MODE === '1' && session.id === 1))) {
+    const session = unsign(secret, bearer);
+    // Токен сотрудника не даёт доступа к кабинету, даже если сотрудник — менеджер
+    if (!session || session.kind === 'user' || !((await isAdmin(session.id)) || (env.DEV_MODE === '1' && session.id === 1))) {
       throw new HttpError(401, 'Требуется вход');
     }
     c.admin = session;

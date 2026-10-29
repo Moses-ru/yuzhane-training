@@ -14,6 +14,11 @@
   <div class="loading-icon"><i class="fas fa-graduation-cap"></i></div>
   <div class="loading-text">Загрузка обучения...</div>
   <div class="loading-error" id="loadingError"></div>
+  <div class="login-box" id="loginBox" hidden>
+    <p>Войдите через Telegram, чтобы проходить обучение с компьютера.<br>Результаты сохранятся в вашем профиле.</p>
+    <div id="loginWidget" class="login-widget"></div>
+    <div class="loading-error" id="loginError"></div>
+  </div>
 </div>
 
 <header>
@@ -60,6 +65,7 @@
       <div class="profile-name" id="profileName">Гость</div>
       <div class="profile-sub" id="profileSub"></div>
       <a class="btn btn-gold" id="adminLink" href="admin/" hidden><i class="fas fa-chart-line"></i> Кабинет менеджера</a>
+      <button class="btn btn-secondary" id="logoutBtn" style="margin-top:10px" hidden><i class="fas fa-arrow-right-from-bracket"></i> Выйти</button>
     </div>
     <h2 class="section-title"><i class="fas fa-chart-bar"></i> Результаты по блокам</h2>
     <div class="list" id="blockStats"></div>
