@@ -29,16 +29,30 @@ function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// Сессия кабинета: «Не выходить» — localStorage (30 дней), иначе sessionStorage (до закрытия вкладки)
+const session = {
+  get() { try { return localStorage.getItem('adm_token') || sessionStorage.getItem('adm_token'); } catch { return null; } },
+  remembered() { try { return !!localStorage.getItem('adm_token'); } catch { return false; } },
+  set(token, remember) {
+    try {
+      localStorage.removeItem('adm_token');
+      sessionStorage.removeItem('adm_token');
+      if (token) (remember ? localStorage : sessionStorage).setItem('adm_token', token);
+    } catch {}
+  }
+};
+
 async function api(path, { method = 'GET', body, raw } = {}) {
-  const headers = { Authorization: `Bearer ${store.get('adm_token') || ''}` };
+  const headers = { Authorization: `Bearer ${session.get() || ''}` };
   if (body && !(body instanceof FormData)) headers['Content-Type'] = 'application/json';
-  const res = await fetch(`${API}/api/admin${path}`, {
+  const base = path.startsWith('/auth') ? '/api' : '/api/admin';
+  const res = await fetch(`${API}${base}${path}`, {
     method, headers, body: body instanceof FormData ? body : body ? JSON.stringify(body) : undefined
   });
-  if (res.status === 401 && !path.startsWith('/auth')) {
-    store.set('adm_token', null);
-    showLogin();
-    throw new Error('Сессия истекла, войдите снова');
+  if (res.status === 401 && !path.startsWith('/auth/login')) {
+    session.set(null);
+    showLogin('Сессия закончилась — войдите снова');
+    throw new Error('Сессия закончилась, войдите снова');
   }
   if (raw && res.ok) return res;
   const data = await res.json().catch(() => ({}));
@@ -55,10 +69,12 @@ function toast(text, type = 'ok') {
 }
 const fail = e => toast(e.message, 'err');
 
-const fullName = u => [u.first_name, u.last_name].filter(Boolean).join(' ') || (u.username ? '@' + u.username : `ID ${u.tg_id ?? u.user_id}`);
+const fullName = u => u.name || u.login || 'Без имени';
 const initials = u => (fullName(u).replace('@', '').split(' ').map(s => s[0]).join('').slice(0, 2) || '?').toUpperCase();
-const avatar = (u, cls = '') => `<div class="ava ${cls}">${u.photo_url ? `<img src="${esc(u.photo_url)}" alt="" onerror="this.remove()">` : ''}${u.photo_url ? '' : esc(initials(u))}</div>`;
-const person = (u, sub) => `<div class="person">${avatar(u)}<div style="min-width:0"><b>${esc(fullName(u))}</b><span>${esc(sub ?? (u.username ? '@' + u.username : 'ID ' + (u.tg_id ?? u.user_id)))}</span></div></div>`;
+const avatar = (u, cls = '') => `<div class="ava ${cls}">${esc(initials(u))}</div>`;
+const person = (u, sub) => `<div class="person">${avatar(u)}<div style="min-width:0"><b>${esc(fullName(u))}</b><span>${esc(sub ?? (u.position || '@' + u.login))}</span></div></div>`;
+const ROLE_TITLES = { waiter: 'Сотрудник', manager: 'Менеджер', admin: 'Администратор' };
+const rolePill = role => role === 'waiter' ? '' : `<span class="pill ${role === 'admin' ? 'gold' : 'warn'} role-pill">${ROLE_TITLES[role]}</span>`;
 
 function parseDate(s) { return s ? new Date(s.replace(' ', 'T') + (s.includes('Z') ? '' : 'Z')) : null; }
 function fmtDate(s, withTime = true) {
@@ -235,80 +251,97 @@ function moveItem(list, id, dir, kind, onDone) {
 
 // ---------- auth ----------
 
+// Шаги формы: login — логин и пароль; change — обязательная смена пароля (первый вход admin / пароль, выданный менеджером)
+let loginStep = 'login';
+let pendingPassword = '';
+let pendingRemember = false;
+
+function setLoginStep(step, sub) {
+  loginStep = step;
+  $$('[data-step]', $('#loginForm')).forEach(el => (el.hidden = el.dataset.step !== step));
+  $('#loginTitle').textContent = step === 'change' ? 'Смена пароля' : 'Кабинет менеджера';
+  $('#loginSub').textContent = sub || (step === 'change' ? 'Придумайте новый пароль' : 'Обучение сотрудников «Южане»');
+  $('#loginSubmit').textContent = step === 'change' ? 'Сохранить и войти' : 'Войти';
+  $('#loginHint').hidden = step === 'change';
+  setTimeout(() => $(step === 'change' ? '[name=new_password]' : '[name=login]', $('#loginForm')).focus(), 50);
+}
+
 function showLogin(errorText) {
   $('#shell').hidden = true;
   $('#login').hidden = false;
-  if (errorText) $('#loginError').textContent = errorText;
-  renderLoginWidget();
+  $('#loginError').textContent = errorText || '';
+  if (loginStep !== 'change') setLoginStep('login');
 }
 
-let loginRendered = false;
-async function renderLoginWidget() {
-  if (loginRendered) return;
-  loginRendered = true;
-  const box = $('#loginWidget');
-  box.innerHTML = loader();
+$('#loginForm').onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target;
+  const err = msg => ($('#loginError').textContent = msg);
+  err('');
+  $('#loginSubmit').disabled = true;
   try {
-    const cfg = await fetch(`${API}/api/admin/config`).then(r => r.json());
-    box.innerHTML = '';
-    if (cfg.bot_username) {
-      const s = document.createElement('script');
-      s.async = true;
-      s.src = 'https://telegram.org/js/telegram-widget.js?22';
-      s.dataset.telegramLogin = cfg.bot_username;
-      s.dataset.size = 'large';
-      s.dataset.radius = '12';
-      s.dataset.onauth = 'onTelegramAuth(user)';
-      s.dataset.requestAccess = 'write';
-      box.appendChild(s);
-      $('#loginHint').innerHTML = `Войдите через Telegram. Доступ есть только у менеджеров.<br>Узнать свой ID: команда <span class="code">/id</span> в боте @${esc(cfg.bot_username)}`;
-    } else if (!cfg.dev_mode) {
-      box.innerHTML = '<p class="muted">Бот не настроен: задайте BOT_TOKEN в Cloudflare.</p>';
+    if (loginStep === 'login') {
+      if (!f.login.value.trim() || !f.password.value) return err('Введите логин и пароль');
+      const r = await api('/auth/login', { method: 'POST', body: { login: f.login.value.trim(), password: f.password.value, remember: f.remember.checked } });
+      if (r.account.role === 'waiter') return err('У этой учётной записи нет доступа к кабинету. Сотрудники входят в приложение обучения.');
+      session.set(r.token, r.remember);
+      if (r.account.must_change_password) {
+        pendingPassword = f.password.value;
+        pendingRemember = r.remember;
+        return setLoginStep('change', r.account.login === 'admin'
+          ? 'Это первый вход с паролем по умолчанию. Задайте свой пароль — без этого кабинет не откроется.'
+          : 'Пароль был выдан администратором — придумайте свой');
+      }
+    } else {
+      if (f.new_password.value.length < 6) return err('Пароль должен быть не короче 6 символов');
+      if (f.new_password.value !== f.new_password2.value) return err('Пароли не совпадают');
+      const r = await api('/auth/password', { method: 'POST', body: { old_password: pendingPassword, new_password: f.new_password.value, remember: pendingRemember } });
+      session.set(r.token, r.remember);
+      pendingPassword = '';
+      toast('Пароль изменён');
     }
-    if (cfg.dev_mode) {
-      const b = document.createElement('button');
-      b.className = 'btn btn-gold';
-      b.innerHTML = '<i class="fas fa-code"></i> Войти (режим разработки)';
-      b.onclick = () => doLogin('/auth/dev', {});
-      box.appendChild(b);
-    }
-  } catch {
-    box.innerHTML = '<p class="login-error">API недоступен. Проверьте адрес в config.js</p>';
-    loginRendered = false;
-  }
-}
-
-async function doLogin(path, body) {
-  $('#loginError').textContent = '';
-  try {
-    const { token } = await api(path, { method: 'POST', body });
-    store.set('adm_token', token);
+    f.reset();
+    setLoginStep('login');
     await boot();
-  } catch (e) {
-    $('#loginError').textContent = e.message;
+  } catch (e2) {
+    err(e2.message);
+  } finally {
+    $('#loginSubmit').disabled = false;
   }
-}
-window.onTelegramAuth = user => doLogin('/auth/telegram', user);
+};
 
-$('#logoutBtn').onclick = () => { store.set('adm_token', null); location.hash = ''; showLogin(); };
+$('#logoutBtn').onclick = () => { session.set(null); location.hash = ''; me = null; showLogin(); };
 $('#menuBtn').onclick = () => { $('#sidebar').classList.add('open'); $('#backdrop').classList.add('open'); };
 $('#backdrop').onclick = () => { $('#sidebar').classList.remove('open'); $('#backdrop').classList.remove('open'); };
 
-let me = null;
-async function boot() {
-  if (!store.get('adm_token') && tg?.initData) {
-    // Открыто из Telegram — входим автоматически
-    try {
-      const { token } = await api('/auth/webapp', { method: 'POST', body: { initData: tg.initData } });
-      store.set('adm_token', token);
-      tg.ready(); tg.expand();
-    } catch (e) { return showLogin(e.message); }
+$('#passwordBtn').onclick = () => modal({
+  title: 'Сменить пароль',
+  body: `
+    <label class="field"><span>Текущий пароль</span><input type="password" name="old_password" autocomplete="current-password"></label>
+    <label class="field"><span>Новый пароль</span><input type="password" name="new_password" autocomplete="new-password" placeholder="Не короче 6 символов"></label>
+    <label class="field"><span>Повторите новый пароль</span><input type="password" name="new_password2" autocomplete="new-password"></label>
+    <div class="muted small">После смены пароля остальные ваши сессии (на других устройствах) завершатся.</div>`,
+  onSave: async form => {
+    const v = formValues(form);
+    if (v.new_password !== v.new_password2) throw new Error('Пароли не совпадают');
+    const r = await api('/auth/password', { method: 'POST', body: { old_password: v.old_password, new_password: v.new_password, remember: session.remembered() } });
+    session.set(r.token, r.remember);
+    toast('Пароль изменён');
   }
-  if (!store.get('adm_token')) return showLogin();
-  try { me = await api('/me'); } catch { return; }
+});
+
+let me = null;
+const isAdminRole = () => me?.role === 'admin';
+
+async function boot() {
+  if (!session.get()) return showLogin();
+  try { me = await api('/auth/me'); } catch { return; }
+  if (me.role === 'waiter') { session.set(null); return showLogin('У этой учётной записи нет доступа к кабинету'); }
+  if (me.must_change_password) { session.set(null); return showLogin('Войдите снова и смените пароль'); }
   $('#login').hidden = true;
   $('#shell').hidden = false;
-  $('#me').innerHTML = `${avatar({ first_name: me.name, photo_url: me.photo })}<div><b>${esc(me.name || 'Менеджер')}</b><span>ID ${me.id}</span></div>`;
+  $$('[data-admin-only]').forEach(el => (el.hidden = !isAdminRole()));
+  $('#me').innerHTML = `${avatar(me)}<div><b>${esc(fullName(me))}</b><span>${ROLE_TITLES[me.role]}</span></div>`;
   router();
 }
 
@@ -317,7 +350,8 @@ async function boot() {
 const pages = {};
 function router() {
   const [, section = '', id, sub] = (location.hash.replace(/^#/, '') || '/').split('/');
-  const name = { '': 'dashboard', users: 'users', results: 'results', content: 'content', refs: 'refs', settings: 'settings' }[section] || 'dashboard';
+  let name = { '': 'dashboard', users: 'users', results: 'results', content: 'content', refs: 'refs', settings: 'settings' }[section] || 'dashboard';
+  if (name === 'settings' && !isAdminRole()) name = 'dashboard';
   $$('.menu a').forEach(a => a.classList.toggle('active', a.dataset.route === name));
   $('#sidebar').classList.remove('open');
   $('#backdrop').classList.remove('open');
@@ -399,13 +433,16 @@ let usersFilter = { q: '', status: 'all' };
 pages.users = async () => {
   const { users, blocks } = await api('/users');
   view().innerHTML = `
-    <div class="page-head"><div><h1>Сотрудники</h1><p>Все, кто открывал приложение через бота</p></div>
-      <div class="actions"><button class="btn" id="exportBtn"><i class="fas fa-file-excel"></i> Выгрузить в Excel</button></div></div>
+    <div class="page-head"><div><h1>Сотрудники</h1><p>Учётные записи и прогресс обучения</p></div>
+      <div class="actions">
+        <button class="btn" id="exportBtn"><i class="fas fa-file-excel"></i> Выгрузить в Excel</button>
+        <button class="btn btn-primary" id="addUser"><i class="fas fa-user-plus"></i> Добавить</button>
+      </div></div>
     <div class="card">
       <div class="toolbar">
-        <div class="search"><i class="fas fa-search"></i><input type="search" id="q" placeholder="Имя, @username, должность или ID" value="${esc(usersFilter.q)}"></div>
+        <div class="search"><i class="fas fa-search"></i><input type="search" id="q" placeholder="Имя, логин или должность" value="${esc(usersFilter.q)}"></div>
         <div class="tabs" id="statusTabs">
-          ${[['all', 'Все'], ['done', 'Прошли всё'], ['progress', 'В процессе'], ['new', 'Не начали']].map(([k, l]) =>
+          ${[['all', 'Все'], ['done', 'Прошли всё'], ['progress', 'В процессе'], ['new', 'Не начали'], ['staff', 'Менеджеры']].map(([k, l]) =>
             `<button data-s="${k}" class="${usersFilter.status === k ? 'active' : ''}">${l}</button>`).join('')}
         </div>
       </div>
@@ -417,13 +454,14 @@ pages.users = async () => {
   const draw = () => {
     const q = usersFilter.q.toLowerCase();
     const list = users.filter(u => {
-      if (q && !`${fullName(u)} ${u.username} ${u.position} ${u.tg_id}`.toLowerCase().includes(q)) return false;
+      if (q && !`${u.name} ${u.login} ${u.position}`.toLowerCase().includes(q)) return false;
+      if (usersFilter.status === 'staff') return u.role !== 'waiter';
       const st = u.total_blocks && u.passed_count === u.total_blocks ? 'done' : u.attempts ? 'progress' : 'new';
       return usersFilter.status === 'all' || usersFilter.status === st;
     });
     $('#usersBody').innerHTML = list.length ? list.map(u => `
-      <tr class="click" data-id="${u.tg_id}">
-        <td>${person(u)}</td>
+      <tr class="click" data-id="${u.id}">
+        <td><div style="display:flex;align-items:center;gap:8px">${person(u, '@' + u.login)}${rolePill(u.role)}</div></td>
         <td>${u.position ? esc(u.position) : '<span class="muted">—</span>'}</td>
         <td><div style="display:flex;align-items:center;gap:10px">
           <div class="segs" title="${blocks.map((b, i) => `${b.title}: ${u.blocks[i].best != null ? u.blocks[i].best + '%' : '—'}`).join('\n')}">
@@ -432,8 +470,8 @@ pages.users = async () => {
           ${u.total_blocks && u.passed_count === u.total_blocks ? '<span class="pill gold">🏆</span>' : ''}</div></td>
         <td>${u.avg_best != null ? `<b>${u.avg_best}%</b>` : '<span class="muted">—</span>'}</td>
         <td>${u.attempts}</td>
-        <td class="muted small">${ago(u.last_seen)}</td>
-      </tr>`).join('') : `<tr><td colspan="6">${empty('user-slash', users.length ? 'Никого не найдено' : 'Сотрудники появятся здесь, когда откроют приложение в боте')}</td></tr>`;
+        <td class="muted small">${u.last_seen ? ago(u.last_seen) : 'не входил(а)'}</td>
+      </tr>`).join('') : `<tr><td colspan="6">${empty('user-slash', users.length ? 'Никого не найдено' : 'Сотрудники появятся здесь после регистрации')}</td></tr>`;
     $$('#usersBody tr[data-id]').forEach(tr => (tr.onclick = () => (location.hash = `#/users/${tr.dataset.id}`)));
   };
   draw();
@@ -444,7 +482,41 @@ pages.users = async () => {
     draw();
   }));
   $('#exportBtn').onclick = exportCsv;
+  $('#addUser').onclick = () => modal({
+    title: 'Новая учётная запись', saveText: 'Создать',
+    body: `
+      <div class="row">
+        <label class="field"><span>Имя и фамилия</span><input type="text" name="name" placeholder="Анна Иванова"></label>
+        <label class="field"><span>Должность</span><input type="text" name="position" placeholder="Официант"></label>
+      </div>
+      <div class="row">
+        <label class="field"><span>Логин</span><input type="text" name="login" autocomplete="off" autocapitalize="none" placeholder="anna"></label>
+        <label class="field"><span>Временный пароль</span><input type="text" name="password" autocomplete="off" value="${genPassword()}"></label>
+      </div>
+      ${isAdminRole() ? `<label class="field"><span>Роль</span><select name="role">${roleOptions('waiter')}</select></label>` : ''}
+      <label class="check"><input type="checkbox" name="must_change_password" checked> Попросить сменить пароль при первом входе</label>
+      <div class="muted small">Передайте сотруднику логин и пароль. Сотрудники входят в приложение обучения, менеджеры — в этот кабинет.</div>`,
+    onSave: async form => {
+      const v = formValues(form);
+      const { id } = await api('/users', { method: 'POST', body: v });
+      toast(`Учётная запись ${v.login} создана`);
+      location.hash = `#/users/${id}`;
+    }
+  });
 };
+
+const ROLE_HINTS = {
+  waiter: 'проходит обучение в приложении',
+  manager: 'правит блоки, тесты и справочники, видит результаты',
+  admin: 'всё, что менеджер, плюс роли и настройки'
+};
+const roleOptions = selected => Object.entries(ROLE_TITLES).map(([k, t]) =>
+  `<option value="${k}" ${k === selected ? 'selected' : ''}>${t} — ${ROLE_HINTS[k]}</option>`).join('');
+
+function genPassword() {
+  const abc = 'abcdefghijkmnpqrstuvwxyz23456789';
+  return Array.from(crypto.getRandomValues(new Uint8Array(8)), b => abc[b % abc.length]).join('');
+}
 
 async function exportCsv() {
   try {
@@ -460,17 +532,21 @@ pages.usersDetail = async id => {
   const d = await api(`/users/${id}`);
   const u = d.user;
   const passed = d.blocks.filter(b => b.status === 'passed').length;
+  const isSelf = u.id === me.id;
+  // Менеджер управляет только официантами; админ — всеми
+  const canManage = isAdminRole() || u.role === 'waiter';
   view().innerHTML = `
     <a class="back" href="#/users"><i class="fas fa-arrow-left"></i> Сотрудники</a>
     <div class="card mb"><div class="profile">
       ${avatar(u, 'lg')}
       <div style="flex:1;min-width:220px">
-        <h2>${esc(fullName(u))} ${d.is_admin ? '<span class="pill gold">менеджер</span>' : ''}</h2>
+        <h2>${esc(fullName(u))} ${rolePill(u.role)}</h2>
         <div class="meta">
-          ${u.username ? `<a href="https://t.me/${esc(u.username)}" target="_blank"><i class="fab fa-telegram"></i> @${esc(u.username)}</a>` : ''}
-          <span>ID ${u.tg_id}</span>
-          <span><i class="far fa-calendar"></i> с ${fmtDate(u.first_seen, false)}</span>
-          <span><i class="far fa-clock"></i> был(а) ${ago(u.last_seen)}</span>
+          <span><i class="fas fa-user"></i> ${esc(u.login)}</span>
+          ${u.position ? `<span><i class="fas fa-briefcase"></i> ${esc(u.position)}</span>` : ''}
+          <span><i class="far fa-calendar"></i> с ${fmtDate(u.created_at, false)}</span>
+          <span><i class="far fa-clock"></i> ${u.last_seen ? 'был(а) ' + ago(u.last_seen) : 'ещё не входил(а)'}</span>
+          ${u.must_change_password ? '<span class="pill warn">ждёт смены пароля</span>' : ''}
         </div>
       </div>
       <div style="text-align:right">
@@ -490,22 +566,32 @@ pages.usersDetail = async id => {
             <div class="tile-stats"><span>Прочитано уроков</span><span>${b.lessons_viewed}/${b.lessons_total}</span></div>
           </div>`).join('') || empty('layer-group', 'Нет блоков')}</div></div>
       </div>
-      <div class="card">
-        <div class="card-head"><h3>Карточка сотрудника</h3></div>
-        <form class="card-pad" id="userForm">
-          <label class="field"><span>Должность</span><input type="text" name="position" value="${esc(u.position)}" placeholder="Официант, бармен, повар..."></label>
-          <label class="field"><span>Заметка</span><textarea name="note" placeholder="Видна только менеджерам">${esc(u.note)}</textarea></label>
-          <div style="display:flex;gap:8px;flex-wrap:wrap">
-            <button class="btn btn-primary" type="submit"><i class="fas fa-check"></i> Сохранить</button>
-            <button class="btn btn-danger" type="button" id="resetBtn"><i class="fas fa-rotate-left"></i> Сбросить прогресс</button>
+      <div>
+        <div class="card mb">
+          <div class="card-head"><h3>Карточка сотрудника</h3></div>
+          <form class="card-pad" id="userForm">
+            <label class="field"><span>Имя и фамилия</span><input type="text" name="name" value="${esc(u.name)}" ${canManage || isSelf ? '' : 'disabled'}></label>
+            <label class="field"><span>Должность</span><input type="text" name="position" value="${esc(u.position)}" placeholder="Официант, бармен, повар..." ${canManage || isSelf ? '' : 'disabled'}></label>
+            <label class="field"><span>Заметка</span><textarea name="note" placeholder="Видна только менеджерам" ${canManage || isSelf ? '' : 'disabled'}>${esc(u.note)}</textarea></label>
+            ${canManage || isSelf ? `<div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn btn-primary" type="submit"><i class="fas fa-check"></i> Сохранить</button>
+              <button class="btn btn-danger" type="button" id="resetBtn"><i class="fas fa-rotate-left"></i> Сбросить прогресс</button>
+            </div>` : '<div class="muted small">Изменять менеджеров может только администратор.</div>'}
+          </form>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>Доступ</h3></div>
+          <div class="card-pad">
+            ${isAdminRole() && !isSelf ? `
+              <label class="field"><span>Роль</span><select id="roleSelect">${roleOptions(u.role)}</select></label>` :
+              `<p style="margin-bottom:14px">Роль: <b>${ROLE_TITLES[u.role]}</b> — <span class="muted">${ROLE_HINTS[u.role]}</span></p>`}
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              ${canManage && !isSelf ? '<button class="btn" id="pwReset"><i class="fas fa-key"></i> Задать новый пароль</button>' : ''}
+              ${isAdminRole() && !isSelf ? '<button class="btn btn-danger" id="delUser"><i class="fas fa-trash"></i> Удалить учётную запись</button>' : ''}
+            </div>
+            ${isSelf ? '<div class="muted small" style="margin-top:4px">Свой пароль меняйте кнопкой <i class="fas fa-key"></i> внизу меню.</div>' : ''}
           </div>
-          <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--line)">
-            ${d.is_owner ? '<span class="muted small"><i class="fas fa-crown"></i> Владелец — полный доступ к кабинету</span>'
-              : d.is_admin ? '<button class="btn" type="button" id="adminToggle" data-on="1"><i class="fas fa-user-minus"></i> Убрать из менеджеров</button>'
-              : '<button class="btn btn-gold" type="button" id="adminToggle"><i class="fas fa-user-shield"></i> Сделать менеджером</button>'}
-            ${d.is_owner ? '' : '<div class="muted small" style="margin-top:8px">Менеджер видит все результаты и редактирует контент. Входит через «Войти через Telegram» на странице кабинета.</div>'}
-          </div>
-        </form>
+        </div>
       </div>
     </div>
 
@@ -524,23 +610,38 @@ pages.usersDetail = async id => {
 
   $('#userForm').onsubmit = async e => {
     e.preventDefault();
-    try { await api(`/users/${u.tg_id}`, { method: 'PATCH', body: formValues(e.target) }); toast('Сохранено'); } catch (err) { fail(err); }
+    try { await api(`/users/${u.id}`, { method: 'PATCH', body: formValues(e.target) }); toast('Сохранено'); } catch (err) { fail(err); }
   };
-  $('#resetBtn').onclick = async () => {
+  if ($('#resetBtn')) $('#resetBtn').onclick = async () => {
     if (!(await confirmDialog(`Удалить все результаты сотрудника <b>${esc(fullName(u))}</b>? Он начнёт обучение заново.`, 'Сбросить'))) return;
-    try { await api(`/users/${u.tg_id}/progress`, { method: 'DELETE' }); toast('Прогресс сброшен'); router(); } catch (err) { fail(err); }
+    try { await api(`/users/${u.id}/progress`, { method: 'DELETE' }); toast('Прогресс сброшен'); router(); } catch (err) { fail(err); }
+  };
+  if ($('#roleSelect')) $('#roleSelect').onchange = async e => {
+    const role = e.target.value;
+    if (!(await confirmDialog(`Назначить <b>${esc(fullName(u))}</b> роль «${ROLE_TITLES[role]}»? Права изменятся при следующем входе.`, 'Назначить'))) {
+      e.target.value = u.role;
+      return;
+    }
+    try { await api(`/users/${u.id}/role`, { method: 'PATCH', body: { role } }); toast(`${fullName(u)}: ${ROLE_TITLES[role]}`); router(); }
+    catch (err) { fail(err); e.target.value = u.role; }
+  };
+  if ($('#pwReset')) $('#pwReset').onclick = () => modal({
+    title: 'Новый пароль', saveText: 'Сохранить пароль',
+    body: `
+      <label class="field"><span>Новый пароль для ${esc(u.login)}</span><input type="text" name="password" value="${genPassword()}" autocomplete="off"></label>
+      <div class="muted small">Сотрудник войдёт с этим паролем и сразу задаст свой. Текущие сессии на его устройствах завершатся.</div>`,
+    onSave: async form => {
+      const { password } = formValues(form);
+      await api(`/users/${u.id}/password`, { method: 'POST', body: { password } });
+      toast(`Пароль для ${u.login} обновлён — передайте его сотруднику`);
+      router();
+    }
+  });
+  if ($('#delUser')) $('#delUser').onclick = async () => {
+    if (!(await confirmDialog(`Удалить учётную запись <b>${esc(u.login)}</b> вместе со всеми результатами? Это нельзя отменить.`))) return;
+    try { await api(`/users/${u.id}`, { method: 'DELETE' }); toast('Учётная запись удалена'); location.hash = '#/users'; } catch (err) { fail(err); }
   };
   $$('[data-attempt]').forEach(tr => (tr.onclick = () => showAttempt(tr.dataset.attempt)));
-  if ($('#adminToggle')) $('#adminToggle').onclick = async e => {
-    const on = !!e.currentTarget.dataset.on;
-    if (on && !(await confirmDialog(`Убрать у <b>${esc(fullName(u))}</b> доступ к кабинету?`, 'Убрать'))) return;
-    try {
-      if (on) await api(`/admins/${u.tg_id}`, { method: 'DELETE' });
-      else await api('/admins', { method: 'POST', body: { tg_id: u.tg_id, name: u.position || '' } });
-      toast(on ? 'Доступ к кабинету убран' : `${fullName(u)} теперь менеджер`);
-      router();
-    } catch (err) { fail(err); }
-  };
 };
 
 async function showAttempt(id) {
@@ -596,7 +697,7 @@ pages.results = async () => {
       const rows = await api(`/attempts?${qs}`);
       $('#resBody').innerHTML = rows.length ? rows.map(a => `
         <tr class="click" data-attempt="${a.id}">
-          <td>${person(a, a.position || (a.username ? '@' + a.username : ''))}</td>
+          <td>${person(a)}</td>
           <td>${esc(a.block_title)}</td>
           <td>${scoreHtml(a.percent, a.passed)} <span class="muted small">${a.correct}/${a.total}</span></td>
           <td>${a.passed ? '<span class="pill ok">Сдано</span>' : '<span class="pill bad">Не сдано</span>'}</td>
@@ -902,9 +1003,9 @@ pages.refs = async () => {
 // ---------- settings ----------
 
 pages.settings = async () => {
-  const [s, admins] = await Promise.all([api('/settings'), api('/admins')]);
+  const s = await api('/settings');
   view().innerHTML = `
-    <div class="page-head"><div><h1>Настройки</h1><p>Тексты приложения, доступ менеджеров и бот</p></div></div>
+    <div class="page-head"><div><h1>Настройки</h1><p>Тексты приложения, регистрация, бот и импорт</p></div></div>
     <div class="grid half">
       <form class="card" id="settingsForm">
         <div class="card-head"><h3>Приложение</h3><button class="btn btn-primary btn-sm" type="submit"><i class="fas fa-check"></i> Сохранить</button></div>
@@ -912,7 +1013,8 @@ pages.settings = async () => {
           <label class="field"><span>Название</span><input type="text" name="app_title" value="${esc(s.app_title)}"></label>
           <label class="field"><span>Приветствие на главной</span><textarea name="welcome_text" rows="2">${esc(s.welcome_text)}</textarea></label>
           <label class="check"><input type="checkbox" name="sequential" ${s.sequential === '1' ? 'checked' : ''}> Последовательное прохождение блоков</label>
-          <label class="check"><input type="checkbox" name="notify_admins" ${s.notify_admins === '1' ? 'checked' : ''}> Присылать менеджерам в Telegram результаты тестов</label>
+          <label class="check"><input type="checkbox" name="allow_registration" ${s.allow_registration !== '0' ? 'checked' : ''}> Разрешить сотрудникам регистрироваться самим</label>
+          <label class="check"><input type="checkbox" name="notify_admins" ${s.notify_admins === '1' ? 'checked' : ''}> Присылать владельцу в Telegram результаты тестов</label>
           <div class="menu-label" style="padding-left:0;color:var(--muted)">Сертификат</div>
           <label class="field"><span>Заголовок</span><input type="text" name="certificate_title" value="${esc(s.certificate_title)}"></label>
           <label class="field"><span>Текст</span><textarea name="certificate_text" rows="2">${esc(s.certificate_text)}</textarea></label>
@@ -921,26 +1023,16 @@ pages.settings = async () => {
       </form>
       <div>
         <div class="card mb">
-          <div class="card-head"><h3>Менеджеры</h3></div>
-          <div class="list">${admins.map(a => `
-            <div class="list-item">
-              ${person({ ...a, first_name: a.first_name || a.name || 'Без имени' }, `ID ${a.tg_id}${a.name && a.first_name ? ' · ' + a.name : ''}`)}
-              <div style="flex:1"></div>
-              ${a.locked ? '<span class="pill gold">владелец</span>' : `<button class="icon-btn danger" data-deladm="${a.tg_id}" title="Убрать доступ"><i class="fas fa-user-minus"></i></button>`}
-            </div>`).join('') || empty('user-shield', 'Нет менеджеров')}</div>
-          <form class="card-pad" id="adminForm" style="border-top:1px solid var(--line)">
-            <div class="row">
-              <label class="field"><span>Telegram ID</span><input type="text" name="tg_id" placeholder="123456789" inputmode="numeric"></label>
-              <label class="field"><span>Подпись</span><input type="text" name="name" placeholder="Управляющий, Невский"></label>
-            </div>
-            <button class="btn btn-sm" type="submit"><i class="fas fa-user-plus"></i> Дать доступ</button>
-            <div class="muted small" style="margin-top:10px">ID человек узнаёт командой <span class="code">/id</span> в боте или видит при попытке входа.</div>
-          </form>
+          <div class="card-head"><h3>Менеджеры и роли</h3></div>
+          <div class="card-pad">
+            <p class="muted" style="margin-bottom:12px">Откройте сотрудника в разделе «Сотрудники» и выберите роль: <b>Менеджер</b> правит блоки, тесты и справочники и видит результаты; <b>Администратор</b> ещё и назначает роли и меняет настройки.</p>
+            <a class="btn btn-sm" href="#/users"><i class="fas fa-users"></i> К сотрудникам</a>
+          </div>
         </div>
         <div class="card mb">
           <div class="card-head"><h3>Telegram-бот</h3></div>
           <div class="card-pad">
-            <p class="muted" style="margin-bottom:12px">Подключит вебхук, кнопку «Обучение» в меню бота и команды /start, /admin, /id. Нажмите один раз после деплоя.</p>
+            <p class="muted" style="margin-bottom:12px">Подключит вебхук, кнопку «Обучение» в меню бота и команды /start, /admin. Нажмите один раз после деплоя.</p>
             <button class="btn btn-gold" id="botSetup"><i class="fab fa-telegram"></i> Настроить бота</button>
             <div id="botResult" class="small" style="margin-top:10px"></div>
           </div>
@@ -962,16 +1054,9 @@ pages.settings = async () => {
     const v = formValues(e.target);
     v.sequential = String(v.sequential);
     v.notify_admins = String(v.notify_admins);
+    v.allow_registration = String(v.allow_registration);
     try { await api('/settings', { method: 'PUT', body: v }); toast('Настройки сохранены'); } catch (err) { fail(err); }
   };
-  $('#adminForm').onsubmit = async e => {
-    e.preventDefault();
-    try { await api('/admins', { method: 'POST', body: formValues(e.target) }); toast('Доступ выдан'); pages.settings(); } catch (err) { fail(err); }
-  };
-  $$('[data-deladm]').forEach(b => (b.onclick = async () => {
-    if (!(await confirmDialog('Убрать доступ к кабинету?', 'Убрать'))) return;
-    try { await api(`/admins/${b.dataset.deladm}`, { method: 'DELETE' }); pages.settings(); } catch (err) { fail(err); }
-  }));
   $('#botSetup').onclick = async e => {
     e.target.disabled = true;
     try {

@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
-import { verifyWebAppInitData, verifyLoginWidget, botApi, escapeHtml } from './telegram.js';
-import { importFromSheets } from './sheets-import.js';
+import { botApi, escapeHtml } from './telegram.js';
+import { importFromSheets, importContent } from './sheets-import.js';
 
 // ---------- helpers ----------
 
@@ -17,9 +17,7 @@ function pick(obj, fields) {
   return out;
 }
 
-function userName(u) {
-  return [u.first_name, u.last_name].filter(Boolean).join(' ') || (u.username ? '@' + u.username : `ID ${u.tg_id}`);
-}
+const displayName = a => a.name || a.login;
 
 // Тонкая обёртка над D1: позиционные параметры, как в SQLite
 function makeDb(DB) {
@@ -36,10 +34,10 @@ function makeDb(DB) {
         .bind(...keys.map(k => data[k])).run();
       return r.meta.last_row_id;
     },
-    async update(table, id, data, idCol = 'id') {
+    async update(table, id, data) {
       const keys = Object.keys(data);
       if (!keys.length) return;
-      await DB.prepare(`UPDATE ${table} SET ${keys.map(k => `${k} = ?`).join(', ')} WHERE ${idCol} = ?`)
+      await DB.prepare(`UPDATE ${table} SET ${keys.map(k => `${k} = ?`).join(', ')} WHERE id = ?`)
         .bind(...keys.map(k => data[k]), id).run();
     }
   };
@@ -55,8 +53,7 @@ async function sessionSecret(env, db) {
   if (env.SESSION_SECRET) return env.SESSION_SECRET;
   let row = await db.first("SELECT value FROM settings WHERE key = '_session_secret'");
   if (!row) {
-    row = { value: crypto.randomBytes(32).toString('hex') };
-    await db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('_session_secret', ?)", row.value);
+    await db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('_session_secret', ?)", crypto.randomBytes(32).toString('hex'));
     row = await db.first("SELECT value FROM settings WHERE key = '_session_secret'");
   }
   return row.value;
@@ -78,42 +75,59 @@ function unsign(secret, token) {
   } catch { return null; }
 }
 
-const envAdminIds = env => String(env.ADMIN_IDS || '').split(/[,\s]+/).filter(Boolean).map(Number);
+// ---------- пароли ----------
 
-async function adminIds(env, db) {
-  const fromDb = (await db.all('SELECT tg_id FROM admins')).map(r => Number(r.tg_id));
-  return [...new Set([...envAdminIds(env), ...fromDb])];
+// PBKDF2-SHA256 с солью. Число итераций ограничено лимитом CPU бесплатного тарифа Workers.
+const PBKDF2_ITERATIONS = 20000;
+
+async function pbkdf2(password, salt, iterations) {
+  const key = await globalThis.crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+  return Buffer.from(await globalThis.crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, key, 256));
 }
+
+async function hashPassword(password) {
+  const salt = crypto.randomBytes(16);
+  const hash = await pbkdf2(password, salt, PBKDF2_ITERATIONS);
+  return `pbkdf2$${PBKDF2_ITERATIONS}$${salt.toString('base64')}$${hash.toString('base64')}`;
+}
+
+async function verifyPassword(password, stored) {
+  const [scheme, iter, salt, hash] = String(stored || '').split('$');
+  if (scheme !== 'pbkdf2') return false;
+  const actual = await pbkdf2(password, Buffer.from(salt, 'base64'), Number(iter));
+  const expected = Buffer.from(hash, 'base64');
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+
+const LOGIN_RE = /^[\p{L}\p{N}._-]{3,32}$/u;
+function validateCredentials(login, password) {
+  if (!LOGIN_RE.test(login)) throw new HttpError(400, 'Логин: от 3 до 32 символов — буквы, цифры, точка, дефис или подчёркивание');
+  if (String(password || '').length < 6) throw new HttpError(400, 'Пароль должен быть не короче 6 символов');
+}
+
+const ROLES = ['waiter', 'manager', 'admin'];
+const ACCOUNT_PUBLIC = ['id', 'login', 'name', 'role', 'position', 'must_change_password'];
 
 // ---------- seed ----------
 
 let seedChecked = false;
-async function seedIfEmpty(db) {
+async function ensureSeed(db) {
   if (seedChecked) return;
-  seedChecked = true;
-  if ((await db.first('SELECT COUNT(*) AS n FROM blocks')).n > 0) return;
-  if ((await db.first("SELECT value FROM settings WHERE key = '_seeded'"))) return;
-  const seed = [
-    ['Легенды Южан', '🏠', 'История и философия', 'Семья Южан', '18+ — это эталон хинкали с 18 складками.', 'Почему 18+?', ['Цензура', 'Эталон хинкали', 'Просто число'], 1, 'У эталонного хинкали 18 складок.'],
-    ['Сервис', '🤝', 'Стандарты обслуживания', 'Сервис', 'Гость всегда прав.', 'Гость всегда прав?', ['Да', 'Нет'], 0, 'Да!'],
-    ['Кухня', '🍳', 'Меню и блюда', 'Кухня', 'Хинкали едят руками.', 'Чем едят хинкали?', ['Вилкой', 'Руками'], 1, 'Руками!'],
-    ['Бар и вино', '🍷', 'Винная карта', 'Бар и вино', 'Вино подбирается под блюдо.', 'Как подбирают вино?', ['Под блюдо', 'Случайно'], 0, 'Под блюдо!']
-  ];
-  for (const [i, [title, icon, desc, lt, ltext, qt, opts, correct, expl]] of seed.entries()) {
-    const id = await db.insert('blocks', { title, icon, description: desc, sort: i });
+  // Первый вход в кабинет: admin / admin, пароль нужно сменить сразу после входа
+  if (!(await db.first("SELECT id FROM accounts WHERE role = 'admin' LIMIT 1"))) {
+    await db.run(
+      "INSERT OR IGNORE INTO accounts (login, password_hash, name, role, must_change_password) VALUES ('admin', ?, 'Администратор', 'admin', 1)",
+      await hashPassword('admin'));
+  }
+  if ((await db.first('SELECT COUNT(*) AS n FROM blocks')).n === 0 && !(await db.first("SELECT value FROM settings WHERE key = '_seeded'"))) {
+    const id = await db.insert('blocks', { title: 'Первый блок', icon: '📘', description: 'Пример — отредактируйте в кабинете', sort: 0 });
     await db.batch([
-      db.stmt('INSERT INTO lessons (block_id, sort, title, text) VALUES (?, 0, ?, ?)', id, lt, ltext),
-      db.stmt('INSERT INTO questions (block_id, sort, text, options, correct, explanation) VALUES (?, 0, ?, ?, ?, ?)', id, qt, JSON.stringify(opts), correct, expl)
+      db.stmt('INSERT INTO lessons (block_id, sort, title, text) VALUES (?, 0, ?, ?)', id, 'Добро пожаловать', 'Здесь будет материал урока.'),
+      db.stmt('INSERT INTO questions (block_id, sort, text, options, correct, explanation) VALUES (?, 0, ?, ?, 0, ?)', id, 'Пример вопроса', JSON.stringify(['Правильный ответ', 'Неправильный']), 'Пояснение к ответу')
     ]);
+    await db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('_seeded', '1')");
   }
-  const refs = [['Меню', '🍽️', [['Хинкали', '🥟 18 складок'], ['Хачапури', '🧀 Сыр']]],
-    ['Вино', '🍷', [['Стейк', '🍷 Красное'], ['Рыба', '🥂 Белое']]],
-    ['Аллергены', '⚠️', [['Орехи', '⚠️ Орехи'], ['Глютен', '⚠️ Глютен']]]];
-  for (const [i, [title, icon, items]] of refs.entries()) {
-    const id = await db.insert('ref_categories', { title, icon, sort: i });
-    await db.batch(items.map(([t, b], j) => db.stmt('INSERT INTO ref_items (category_id, title, body, sort) VALUES (?, ?, ?, ?)', id, t, b, j)));
-  }
-  await db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('_seeded', '1')");
+  seedChecked = true;
 }
 
 // ---------- domain ----------
@@ -122,8 +136,7 @@ const publishedBlocks = db => db.all('SELECT * FROM blocks WHERE published = 1 O
 
 // Статусы блоков для сотрудника: passed / available / locked
 async function blockStatuses(db, userId) {
-  const settings = await getSettings(db);
-  const sequential = settings.sequential === '1';
+  const sequential = (await getSettings(db)).sequential === '1';
   const rows = await db.all(`
     SELECT block_id, MAX(percent) AS best, MAX(passed) AS passed, COUNT(*) AS attempts
     FROM attempts WHERE user_id = ? AND finished_at IS NOT NULL GROUP BY block_id`, userId);
@@ -143,17 +156,6 @@ async function loadAvailableBlock(db, userId, blockId) {
   if (!entry) throw new HttpError(404, 'Блок не найден');
   if (entry.status === 'locked') throw new HttpError(403, 'Сначала пройдите предыдущий блок');
   return entry.block;
-}
-
-async function upsertUser(db, u) {
-  await db.run(`
-    INSERT INTO users (tg_id, first_name, last_name, username, photo_url) VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(tg_id) DO UPDATE SET
-      first_name = excluded.first_name, last_name = excluded.last_name, username = excluded.username,
-      photo_url = CASE WHEN excluded.photo_url != '' THEN excluded.photo_url ELSE users.photo_url END,
-      last_seen = datetime('now')`,
-    u.id, u.first_name || '', u.last_name || '', u.username || '', u.photo_url || '');
-  return db.first('SELECT * FROM users WHERE tg_id = ?', u.id);
 }
 
 const BLOCK_PUBLIC = ['id', 'title', 'description', 'icon', 'cover', 'pass_percent'];
@@ -181,6 +183,7 @@ const nextSort = async (db, table, where = '', ...a) =>
 const parseQ = q => ({ ...q, options: JSON.parse(q.options) });
 
 // ---------- routes ----------
+// auth: null — без входа; 'user' — любая учётная запись; 'manager' — менеджер или админ; 'admin' — только админ
 
 const routes = [];
 const route = (method, path, auth, handler) => {
@@ -189,11 +192,75 @@ const route = (method, path, auth, handler) => {
   routes.push({ method, re, keys, auth, handler });
 };
 
-// --- сотрудник (Telegram WebApp) ---
+// --- вход и регистрация ---
 
-route('GET', '/api/app', 'user', async ({ db, user, isAdmin }) => {
+const SESSION_SHORT_HOURS = 12;
+const SESSION_LONG_DAYS = 30;
+
+function issueSession(secret, account, remember) {
+  const ttl = remember ? SESSION_LONG_DAYS * 86400e3 : SESSION_SHORT_HOURS * 3600e3;
+  return {
+    token: sign(secret, { kind: 'acc', id: account.id, v: account.token_version || 0, exp: Date.now() + ttl }),
+    remember: !!remember,
+    account: pick(account, ACCOUNT_PUBLIC)
+  };
+}
+
+route('GET', '/api/config', null, async ({ db }) => {
+  const s = await getSettings(db);
+  return { app_title: s.app_title, allow_registration: s.allow_registration !== '0' };
+});
+
+route('POST', '/api/auth/register', null, async ({ db, body, secret }) => {
+  if ((await getSettings(db)).allow_registration === '0') throw new HttpError(403, 'Регистрация закрыта. Обратитесь к менеджеру.');
+  const login = String(body.login || '').trim();
+  const name = String(body.name || '').trim();
+  validateCredentials(login, body.password);
+  if (name.length < 2) throw new HttpError(400, 'Укажите имя и фамилию');
+  if (await db.first('SELECT id FROM accounts WHERE login = ?', login)) throw new HttpError(409, 'Такой логин уже занят');
+  const id = await db.insert('accounts', { login, name, password_hash: await hashPassword(body.password), role: 'waiter', last_seen: sqlNow() });
+  return issueSession(secret, await db.first('SELECT * FROM accounts WHERE id = ?', id), body.remember);
+});
+
+const LOCK_AFTER = 5;
+const LOCK_MINUTES = 5;
+const sqlNow = (offsetMs = 0) => new Date(Date.now() + offsetMs).toISOString().replace('T', ' ').slice(0, 19);
+
+route('POST', '/api/auth/login', null, async ({ db, body, secret }) => {
+  const login = String(body.login || '').trim();
+  const account = await db.first('SELECT * FROM accounts WHERE login = ?', login);
+  const fail = new HttpError(401, 'Неверный логин или пароль');
+  if (!account) throw fail;
+  if (account.locked_until && account.locked_until > sqlNow()) {
+    throw new HttpError(429, `Слишком много неудачных попыток. Попробуйте через ${LOCK_MINUTES} минут.`);
+  }
+  if (!(await verifyPassword(String(body.password || ''), account.password_hash))) {
+    const failed = account.failed_logins + 1;
+    await db.run('UPDATE accounts SET failed_logins = ?, locked_until = ? WHERE id = ?',
+      failed >= LOCK_AFTER ? 0 : failed, failed >= LOCK_AFTER ? sqlNow(LOCK_MINUTES * 60e3) : null, account.id);
+    throw fail;
+  }
+  await db.run('UPDATE accounts SET failed_logins = 0, locked_until = NULL, last_seen = ? WHERE id = ?', sqlNow(), account.id);
+  return issueSession(secret, account, body.remember);
+});
+
+route('GET', '/api/auth/me', 'user', ({ account }) => pick(account, ACCOUNT_PUBLIC));
+
+route('POST', '/api/auth/password', 'user', async ({ db, account, body, secret }) => {
+  if (!(await verifyPassword(String(body.old_password || ''), account.password_hash))) throw new HttpError(400, 'Текущий пароль указан неверно');
+  if (String(body.new_password || '').length < 6) throw new HttpError(400, 'Новый пароль должен быть не короче 6 символов');
+  if (body.new_password === body.old_password) throw new HttpError(400, 'Новый пароль должен отличаться от текущего');
+  // Смена пароля завершает все остальные сессии
+  await db.run('UPDATE accounts SET password_hash = ?, must_change_password = 0, token_version = token_version + 1 WHERE id = ?',
+    await hashPassword(body.new_password), account.id);
+  return issueSession(secret, await db.first('SELECT * FROM accounts WHERE id = ?', account.id), body.remember);
+});
+
+// --- сотрудник ---
+
+route('GET', '/api/app', 'user', async ({ db, account }) => {
   const settings = await getSettings(db);
-  const statuses = await blockStatuses(db, user.tg_id);
+  const statuses = await blockStatuses(db, account.id);
   const counts = Object.fromEntries((await db.all(`
     SELECT b.id, (SELECT COUNT(*) FROM lessons WHERE block_id = b.id) AS lessons,
                  (SELECT COUNT(*) FROM questions WHERE block_id = b.id) AS questions FROM blocks b`)).map(r => [r.id, r]));
@@ -201,52 +268,53 @@ route('GET', '/api/app', 'user', async ({ db, user, isAdmin }) => {
   const items = await db.all('SELECT id, category_id, title, body, image FROM ref_items ORDER BY sort, id');
   const history = await db.all(`
     SELECT id, block_id, block_title, correct, total, percent, passed, finished_at
-    FROM attempts WHERE user_id = ? AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 30`, user.tg_id);
+    FROM attempts WHERE user_id = ? AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 30`, account.id);
   const allPassed = statuses.length && statuses.every(s => s.status === 'passed');
   return {
     settings: pick(settings, ['app_title', 'welcome_text', 'certificate_title', 'certificate_text', 'certificate_signature']),
-    user, isAdmin: await isAdmin(user.tg_id),
+    user: pick(account, ACCOUNT_PUBLIC),
+    isAdmin: account.role !== 'waiter',
     blocks: statuses.map(({ block: b, status, best, attempts }) => ({
       ...pick(b, BLOCK_PUBLIC), lessons: counts[b.id].lessons, questions: counts[b.id].questions, status, best, attempts
     })),
-    completedAt: allPassed ? (await db.first('SELECT MAX(finished_at) AS t FROM attempts WHERE user_id = ? AND passed = 1', user.tg_id)).t : null,
+    completedAt: allPassed ? (await db.first('SELECT MAX(finished_at) AS t FROM attempts WHERE user_id = ? AND passed = 1', account.id)).t : null,
     references: cats.map(c => ({ ...c, items: items.filter(i => i.category_id === c.id) })),
     history
   };
 });
 
-route('GET', '/api/blocks/:id', 'user', async ({ db, user, params }) => {
-  const block = await loadAvailableBlock(db, user.tg_id, params.id);
+route('GET', '/api/blocks/:id', 'user', async ({ db, account, params }) => {
+  const block = await loadAvailableBlock(db, account.id, params.id);
   const lessons = await db.all('SELECT id, title, text, image FROM lessons WHERE block_id = ? ORDER BY sort, id', block.id);
-  const viewed = new Set((await db.all('SELECT lesson_id FROM lesson_views WHERE user_id = ?', user.tg_id)).map(r => r.lesson_id));
+  const viewed = new Set((await db.all('SELECT lesson_id FROM lesson_views WHERE user_id = ?', account.id)).map(r => r.lesson_id));
   return { block: pick(block, BLOCK_PUBLIC), lessons: lessons.map(l => ({ ...l, viewed: viewed.has(l.id) })) };
 });
 
-route('POST', '/api/lessons/:id/view', 'user', async ({ db, user, params }) => {
-  await db.run('INSERT OR IGNORE INTO lesson_views (user_id, lesson_id) VALUES (?, ?)', user.tg_id, Number(params.id));
+route('POST', '/api/lessons/:id/view', 'user', async ({ db, account, params }) => {
+  await db.run('INSERT OR IGNORE INTO lesson_views (user_id, lesson_id) VALUES (?, ?)', account.id, Number(params.id));
   return { ok: true };
 });
 
-route('POST', '/api/attempts', 'user', async ({ db, user, body }) => {
-  const block = await loadAvailableBlock(db, user.tg_id, body.block_id);
+route('POST', '/api/attempts', 'user', async ({ db, account, body }) => {
+  const block = await loadAvailableBlock(db, account.id, body.block_id);
   const questions = await db.all('SELECT id, text, image, options FROM questions WHERE block_id = ? ORDER BY sort, id', block.id);
   if (!questions.length) throw new HttpError(400, 'В блоке пока нет вопросов');
-  await db.run('DELETE FROM attempts WHERE user_id = ? AND block_id = ? AND finished_at IS NULL', user.tg_id, block.id);
+  await db.run('DELETE FROM attempts WHERE user_id = ? AND block_id = ? AND finished_at IS NULL', account.id, block.id);
   const attemptId = await db.insert('attempts', {
-    user_id: user.tg_id, block_id: block.id, block_title: block.title, pass_percent: block.pass_percent, total: questions.length
+    user_id: account.id, block_id: block.id, block_title: block.title, pass_percent: block.pass_percent, total: questions.length
   });
   return { attempt_id: attemptId, pass_percent: block.pass_percent, questions: questions.map(parseQ) };
 });
 
-async function loadOpenAttempt(db, user, id) {
-  const attempt = await db.first('SELECT * FROM attempts WHERE id = ? AND user_id = ?', Number(id), user.tg_id);
+async function loadOpenAttempt(db, account, id) {
+  const attempt = await db.first('SELECT * FROM attempts WHERE id = ? AND user_id = ?', Number(id), account.id);
   if (!attempt) throw new HttpError(404, 'Попытка не найдена');
   if (attempt.finished_at) throw new HttpError(400, 'Тест уже завершён');
   return attempt;
 }
 
-route('POST', '/api/attempts/:id/answer', 'user', async ({ db, user, params, body }) => {
-  const attempt = await loadOpenAttempt(db, user, params.id);
+route('POST', '/api/attempts/:id/answer', 'user', async ({ db, account, params, body }) => {
+  const attempt = await loadOpenAttempt(db, account, params.id);
   const q = await db.first('SELECT * FROM questions WHERE id = ? AND block_id = ?', Number(body.question_id), attempt.block_id);
   if (!q) throw new HttpError(404, 'Вопрос не найден');
   const options = JSON.parse(q.options);
@@ -264,27 +332,29 @@ route('POST', '/api/attempts/:id/answer', 'user', async ({ db, user, params, bod
   return { is_correct: first === q.correct, correct: q.correct, selected: first, explanation: q.explanation };
 });
 
-route('POST', '/api/attempts/:id/finish', 'user', async ({ db, env, ctx, user, params }) => {
-  const attempt = await loadOpenAttempt(db, user, params.id);
+route('POST', '/api/attempts/:id/finish', 'user', async ({ db, env, ctx, account, params }) => {
+  const attempt = await loadOpenAttempt(db, account, params.id);
   const correct = (await db.first('SELECT COUNT(*) AS n FROM attempt_answers WHERE attempt_id = ? AND is_correct = 1', attempt.id)).n;
   const percent = attempt.total ? Math.round((correct / attempt.total) * 100) : 0;
   const passed = percent >= attempt.pass_percent ? 1 : 0;
   await db.run("UPDATE attempts SET correct = ?, percent = ?, passed = ?, finished_at = datetime('now') WHERE id = ?", correct, percent, passed, attempt.id);
-  const statuses = await blockStatuses(db, user.tg_id);
+  const statuses = await blockStatuses(db, account.id);
   const allPassed = statuses.length > 0 && statuses.every(s => s.status === 'passed');
 
-  ctx.waitUntil(notifyAdmins(env, db,
-    `${passed ? '✅' : '❌'} <b>${escapeHtml(userName(user))}</b>${user.username ? ' (@' + escapeHtml(user.username) + ')' : ''}\n` +
+  ctx.waitUntil(notifyOwners(env, db,
+    `${passed ? '✅' : '❌'} <b>${escapeHtml(displayName(account))}</b>${account.position ? ' · ' + escapeHtml(account.position) : ''}\n` +
     `Блок «${escapeHtml(attempt.block_title)}»: ${correct}/${attempt.total} (${percent}%)` +
     (allPassed && passed ? '\n🏆 Всё обучение пройдено!' : '')));
 
   return { correct, total: attempt.total, percent, passed: !!passed, pass_percent: attempt.pass_percent, all_passed: allPassed };
 });
 
-async function notifyAdmins(env, db, text) {
+// Уведомления о результатах — в Telegram владельцам из ADMIN_IDS (если бот подключён)
+async function notifyOwners(env, db, text) {
   if (!env.BOT_TOKEN || (await getSettings(db)).notify_admins !== '1') return;
-  await Promise.all((await adminIds(env, db)).map(id =>
-    botApi(env.BOT_TOKEN, 'sendMessage', { chat_id: id, text, parse_mode: 'HTML' }).catch(() => {}))); // админ мог не запускать бота
+  const ids = String(env.ADMIN_IDS || '').split(/[,\s]+/).filter(Boolean);
+  await Promise.all(ids.map(id =>
+    botApi(env.BOT_TOKEN, 'sendMessage', { chat_id: id, text, parse_mode: 'HTML' }).catch(() => {})));
 }
 
 // --- картинки (хранятся в KV) ---
@@ -295,69 +365,26 @@ route('GET', '/img/:key', null, async ({ env, params }) => {
   return new Response(value, { headers: { 'Content-Type': metadata?.type || 'image/jpeg', 'Cache-Control': 'public, max-age=31536000, immutable' } });
 });
 
-// --- вход в кабинет ---
-
-const SESSION_DAYS = 30;
-const issueToken = (secret, u) => ({
-  token: sign(secret, { id: u.id, name: [u.first_name, u.last_name].filter(Boolean).join(' '), photo: u.photo_url || '', exp: Date.now() + SESSION_DAYS * 86400e3 })
-});
-
-route('GET', '/api/admin/config', null, async ({ env }) => {
-  let bot = null;
-  if (env.BOT_TOKEN) bot = await botApi(env.BOT_TOKEN, 'getMe').catch(() => null);
-  return { bot_username: bot?.username || null, dev_mode: env.DEV_MODE === '1' };
-});
-
-route('POST', '/api/admin/auth/telegram', null, async ({ env, body, secret, isAdmin }) => {
-  const u = verifyLoginWidget(env.BOT_TOKEN, pick(body, ['id', 'first_name', 'last_name', 'username', 'photo_url', 'auth_date', 'hash']));
-  if (!u) throw new HttpError(401, 'Не удалось проверить вход через Telegram');
-  if (!(await isAdmin(u.id))) throw new HttpError(403, `Нет доступа. Ваш Telegram ID: ${u.id} — передайте его владельцу.`);
-  return issueToken(secret, u);
-});
-
-route('POST', '/api/admin/auth/webapp', null, async ({ env, body, secret, isAdmin }) => {
-  const u = verifyWebAppInitData(env.BOT_TOKEN, body.initData);
-  if (!u) throw new HttpError(401, 'Не удалось проверить данные Telegram');
-  if (!(await isAdmin(u.id))) throw new HttpError(403, `Нет доступа. Ваш Telegram ID: ${u.id}`);
-  return issueToken(secret, u);
-});
-
-route('POST', '/api/admin/auth/dev', null, async ({ env, secret }) => {
-  if (env.DEV_MODE !== '1') throw new HttpError(404, 'Not found');
-  return issueToken(secret, { id: 1, first_name: 'Dev', last_name: 'Manager' });
-});
-
-route('GET', '/api/admin/me', 'admin', ({ admin }) => admin);
-
-// Вход сотрудника с компьютера (вне Telegram) через Telegram Login Widget
-const USER_SESSION_DAYS = 90;
-route('POST', '/api/auth/telegram', null, async ({ env, db, body, secret }) => {
-  const u = verifyLoginWidget(env.BOT_TOKEN, pick(body, ['id', 'first_name', 'last_name', 'username', 'photo_url', 'auth_date', 'hash']));
-  if (!u) throw new HttpError(401, 'Не удалось проверить вход через Telegram');
-  await upsertUser(db, u);
-  return {
-    token: sign(secret, {
-      kind: 'user',
-      u: pick(u, ['id', 'first_name', 'last_name', 'username', 'photo_url']),
-      exp: Date.now() + USER_SESSION_DAYS * 86400e3
-    })
-  };
-});
-
 // --- кабинет: статистика и результаты ---
 
-route('GET', '/api/admin/stats', 'admin', async ({ db }) => {
+// Служебная учётная запись admin в статистике сотрудников не участвует
+const STAFF = "role != 'admin'";
+
+route('GET', '/api/admin/stats', 'manager', async ({ db }) => {
   const blocks = await publishedBlocks(db);
-  const users = await db.all('SELECT tg_id FROM users');
+  const users = await db.all(`SELECT id FROM accounts WHERE ${STAFF}`);
+  const staff = new Set(users.map(u => u.id));
   const passedByUser = {};
-  for (const r of await db.all('SELECT DISTINCT user_id, block_id FROM attempts WHERE passed = 1')) (passedByUser[r.user_id] ||= new Set()).add(r.block_id);
-  const completed = users.filter(u => blocks.length && blocks.every(b => passedByUser[u.tg_id]?.has(b.id))).length;
+  for (const r of await db.all('SELECT DISTINCT user_id, block_id FROM attempts WHERE passed = 1')) {
+    if (staff.has(r.user_id)) (passedByUser[r.user_id] ||= new Set()).add(r.block_id);
+  }
+  const completed = users.filter(u => blocks.length && blocks.every(b => passedByUser[u.id]?.has(b.id))).length;
   const fin = await db.first('SELECT AVG(percent) AS avg, AVG(passed) AS rate FROM attempts WHERE finished_at IS NOT NULL');
   const week = (await db.first("SELECT COUNT(*) AS n FROM attempts WHERE finished_at >= datetime('now', '-7 days')")).n;
 
   const act = await db.all(`SELECT date(finished_at) AS d, COUNT(*) AS attempts, SUM(passed) AS passed
     FROM attempts WHERE finished_at >= date('now', '-29 days') GROUP BY d`);
-  const nu = await db.all(`SELECT date(first_seen) AS d, COUNT(*) AS n FROM users WHERE first_seen >= date('now', '-29 days') GROUP BY d`);
+  const nu = await db.all(`SELECT date(created_at) AS d, COUNT(*) AS n FROM accounts WHERE created_at >= date('now', '-29 days') GROUP BY d`);
   const activity = [];
   for (let i = 29; i >= 0; i--) {
     const d = new Date(Date.now() - i * 86400e3).toISOString().slice(0, 10);
@@ -391,8 +418,8 @@ route('GET', '/api/admin/stats', 'admin', async ({ db }) => {
       WHERE a.finished_at IS NOT NULL GROUP BY aa.question_id HAVING wrong > 0
       ORDER BY CAST(wrong AS REAL) / COUNT(*) DESC, COUNT(*) DESC LIMIT 6`),
     recent: await db.all(`
-      SELECT a.*, u.first_name, u.last_name, u.username, u.photo_url
-      FROM attempts a JOIN users u ON u.tg_id = a.user_id
+      SELECT a.*, u.name, u.login, u.position
+      FROM attempts a JOIN accounts u ON u.id = a.user_id
       WHERE a.finished_at IS NOT NULL ORDER BY a.finished_at DESC LIMIT 8`)
   };
 });
@@ -405,11 +432,13 @@ async function bestByUser(db) {
   return best;
 }
 
-route('GET', '/api/admin/users', 'admin', async ({ db }) => {
+const ACCOUNT_ADMIN_VIEW = 'id, login, name, role, position, note, created_at, last_seen, must_change_password';
+
+route('GET', '/api/admin/users', 'manager', async ({ db }) => {
   const blocks = await publishedBlocks(db);
   const best = await bestByUser(db);
-  const users = (await db.all('SELECT * FROM users ORDER BY last_seen DESC')).map(u => {
-    const r = best[u.tg_id] || {};
+  const users = (await db.all(`SELECT ${ACCOUNT_ADMIN_VIEW} FROM accounts ORDER BY COALESCE(last_seen, created_at) DESC`)).map(u => {
+    const r = best[u.id] || {};
     const per = blocks.map(b => ({ id: b.id, best: r[b.id]?.best ?? null, passed: !!r[b.id]?.passed }));
     const tried = per.filter(p => p.best != null);
     return {
@@ -424,85 +453,143 @@ route('GET', '/api/admin/users', 'admin', async ({ db }) => {
   return { users, blocks: blocks.map(b => pick(b, ['id', 'title', 'icon'])) };
 });
 
-route('GET', '/api/admin/users/:id', 'admin', async ({ db, env, params, isAdmin }) => {
-  const user = await db.first('SELECT * FROM users WHERE tg_id = ?', Number(params.id));
-  if (!user) throw new HttpError(404, 'Сотрудник не найден');
-  const statuses = await blockStatuses(db, user.tg_id);
+async function loadAccount(db, id) {
+  const a = await db.first('SELECT * FROM accounts WHERE id = ?', Number(id));
+  if (!a) throw new HttpError(404, 'Сотрудник не найден');
+  return a;
+}
+
+// Менеджер управляет только официантами; админ — всеми
+function assertCanManage(actor, target) {
+  if (actor.role !== 'admin' && target.role !== 'waiter') throw new HttpError(403, 'Это может сделать только администратор');
+}
+
+route('POST', '/api/admin/users', 'manager', async ({ db, account, body }) => {
+  const login = String(body.login || '').trim();
+  const name = String(body.name || '').trim();
+  const role = ROLES.includes(body.role) ? body.role : 'waiter';
+  if (role !== 'waiter' && account.role !== 'admin') throw new HttpError(403, 'Назначать менеджеров может только администратор');
+  validateCredentials(login, body.password);
+  if (!name) throw new HttpError(400, 'Укажите имя');
+  if (await db.first('SELECT id FROM accounts WHERE login = ?', login)) throw new HttpError(409, 'Такой логин уже занят');
+  const id = await db.insert('accounts', {
+    login, name, role, position: String(body.position || ''),
+    password_hash: await hashPassword(body.password), must_change_password: body.must_change_password ? 1 : 0
+  });
+  return { id };
+});
+
+route('GET', '/api/admin/users/:id', 'manager', async ({ db, params }) => {
+  const user = await loadAccount(db, params.id);
+  const statuses = await blockStatuses(db, user.id);
   const lessonCounts = Object.fromEntries((await db.all('SELECT block_id, COUNT(*) AS n FROM lessons GROUP BY block_id')).map(r => [r.block_id, r.n]));
   const viewed = Object.fromEntries((await db.all(`
     SELECT l.block_id, COUNT(*) AS n FROM lesson_views v JOIN lessons l ON l.id = v.lesson_id
-    WHERE v.user_id = ? GROUP BY l.block_id`, user.tg_id)).map(r => [r.block_id, r.n]));
+    WHERE v.user_id = ? GROUP BY l.block_id`, user.id)).map(r => [r.block_id, r.n]));
   return {
-    user, is_admin: await isAdmin(user.tg_id), is_owner: envAdminIds(env).includes(user.tg_id),
+    user: pick(user, ACCOUNT_ADMIN_VIEW.split(', ')),
     blocks: statuses.map(s => ({
       id: s.block.id, title: s.block.title, icon: s.block.icon, status: s.status, best: s.best, attempts: s.attempts,
       lessons_total: lessonCounts[s.block.id] || 0, lessons_viewed: viewed[s.block.id] || 0
     })),
-    attempts: await db.all('SELECT * FROM attempts WHERE user_id = ? AND finished_at IS NOT NULL ORDER BY finished_at DESC', user.tg_id)
+    attempts: await db.all('SELECT * FROM attempts WHERE user_id = ? AND finished_at IS NOT NULL ORDER BY finished_at DESC', user.id)
   };
 });
 
-route('PATCH', '/api/admin/users/:id', 'admin', async ({ db, params, body }) => {
-  await db.update('users', Number(params.id), pick(body, ['position', 'note']), 'tg_id');
+route('PATCH', '/api/admin/users/:id', 'manager', async ({ db, account, params, body }) => {
+  const target = await loadAccount(db, params.id);
+  if (target.id !== account.id) assertCanManage(account, target);
+  const data = pick(body, ['name', 'position', 'note']);
+  for (const k of Object.keys(data)) data[k] = String(data[k]).trim();
+  await db.update('accounts', target.id, data);
   return { ok: true };
 });
 
-route('DELETE', '/api/admin/users/:id/progress', 'admin', async ({ db, params }) => {
-  const id = Number(params.id);
+route('PATCH', '/api/admin/users/:id/role', 'admin', async ({ db, account, params, body }) => {
+  const target = await loadAccount(db, params.id);
+  if (!ROLES.includes(body.role)) throw new HttpError(400, 'Неизвестная роль');
+  if (target.id === account.id) throw new HttpError(400, 'Нельзя изменить собственную роль');
+  if (target.role === 'admin' && body.role !== 'admin' &&
+      (await db.first("SELECT COUNT(*) AS n FROM accounts WHERE role = 'admin'")).n <= 1) {
+    throw new HttpError(400, 'Должен остаться хотя бы один администратор');
+  }
+  // Смена роли завершает сессии этого человека — новые права применятся при следующем входе
+  await db.run('UPDATE accounts SET role = ?, token_version = token_version + 1 WHERE id = ?', body.role, target.id);
+  return { ok: true };
+});
+
+route('POST', '/api/admin/users/:id/password', 'manager', async ({ db, account, params, body }) => {
+  const target = await loadAccount(db, params.id);
+  assertCanManage(account, target);
+  if (String(body.password || '').length < 6) throw new HttpError(400, 'Пароль должен быть не короче 6 символов');
+  await db.run('UPDATE accounts SET password_hash = ?, must_change_password = 1, token_version = token_version + 1, failed_logins = 0, locked_until = NULL WHERE id = ?',
+    await hashPassword(body.password), target.id);
+  return { ok: true };
+});
+
+route('DELETE', '/api/admin/users/:id/progress', 'manager', async ({ db, account, params }) => {
+  const target = await loadAccount(db, params.id);
+  if (target.id !== account.id) assertCanManage(account, target);
   await db.batch([
-    db.stmt('DELETE FROM attempt_answers WHERE attempt_id IN (SELECT id FROM attempts WHERE user_id = ?)', id),
-    db.stmt('DELETE FROM attempts WHERE user_id = ?', id),
-    db.stmt('DELETE FROM lesson_views WHERE user_id = ?', id)
+    db.stmt('DELETE FROM attempt_answers WHERE attempt_id IN (SELECT id FROM attempts WHERE user_id = ?)', target.id),
+    db.stmt('DELETE FROM attempts WHERE user_id = ?', target.id),
+    db.stmt('DELETE FROM lesson_views WHERE user_id = ?', target.id)
   ]);
   return { ok: true };
 });
 
-route('DELETE', '/api/admin/users/:id', 'admin', async ({ db, params }) => {
-  const id = Number(params.id);
+route('DELETE', '/api/admin/users/:id', 'admin', async ({ db, account, params }) => {
+  const target = await loadAccount(db, params.id);
+  if (target.id === account.id) throw new HttpError(400, 'Нельзя удалить собственную учётную запись');
+  if (target.role === 'admin' && (await db.first("SELECT COUNT(*) AS n FROM accounts WHERE role = 'admin'")).n <= 1) {
+    throw new HttpError(400, 'Должен остаться хотя бы один администратор');
+  }
   await db.batch([
-    db.stmt('DELETE FROM attempt_answers WHERE attempt_id IN (SELECT id FROM attempts WHERE user_id = ?)', id),
-    db.stmt('DELETE FROM attempts WHERE user_id = ?', id),
-    db.stmt('DELETE FROM lesson_views WHERE user_id = ?', id),
-    db.stmt('DELETE FROM users WHERE tg_id = ?', id)
+    db.stmt('DELETE FROM attempt_answers WHERE attempt_id IN (SELECT id FROM attempts WHERE user_id = ?)', target.id),
+    db.stmt('DELETE FROM attempts WHERE user_id = ?', target.id),
+    db.stmt('DELETE FROM lesson_views WHERE user_id = ?', target.id),
+    db.stmt('DELETE FROM accounts WHERE id = ?', target.id)
   ]);
   return { ok: true };
 });
 
-route('GET', '/api/admin/attempts', 'admin', async ({ db, query }) => {
+route('GET', '/api/admin/attempts', 'manager', async ({ db, query }) => {
   const where = ['a.finished_at IS NOT NULL'];
   const args = [];
   if (query.get('block_id')) { where.push('a.block_id = ?'); args.push(Number(query.get('block_id'))); }
   if (['0', '1'].includes(query.get('passed'))) { where.push('a.passed = ?'); args.push(Number(query.get('passed'))); }
   if (query.get('q')) {
-    where.push("(u.first_name || ' ' || u.last_name || ' ' || u.username || ' ' || u.tg_id) LIKE ?");
+    where.push("(u.name || ' ' || u.login || ' ' || u.position) LIKE ?");
     args.push(`%${query.get('q')}%`);
   }
   const limit = Math.min(Number(query.get('limit')) || 200, 500);
   return db.all(`
-    SELECT a.*, u.first_name, u.last_name, u.username, u.photo_url, u.position
-    FROM attempts a JOIN users u ON u.tg_id = a.user_id
+    SELECT a.*, u.name, u.login, u.position
+    FROM attempts a JOIN accounts u ON u.id = a.user_id
     WHERE ${where.join(' AND ')} ORDER BY a.finished_at DESC LIMIT ${limit}`, ...args);
 });
 
-route('GET', '/api/admin/attempts/:id', 'admin', async ({ db, params }) => {
+route('GET', '/api/admin/attempts/:id', 'manager', async ({ db, params }) => {
   const attempt = await db.first(`
-    SELECT a.*, u.first_name, u.last_name, u.username, u.photo_url
-    FROM attempts a JOIN users u ON u.tg_id = a.user_id WHERE a.id = ?`, Number(params.id));
+    SELECT a.*, u.name, u.login, u.position
+    FROM attempts a JOIN accounts u ON u.id = a.user_id WHERE a.id = ?`, Number(params.id));
   if (!attempt) throw new HttpError(404, 'Попытка не найдена');
   return { attempt, answers: await db.all('SELECT * FROM attempt_answers WHERE attempt_id = ? ORDER BY answered_at', attempt.id) };
 });
 
-route('GET', '/api/admin/export/results.csv', 'admin', async ({ db }) => {
+const ROLE_TITLES = { waiter: 'Сотрудник', manager: 'Менеджер', admin: 'Администратор' };
+
+route('GET', '/api/admin/export/results.csv', 'manager', async ({ db }) => {
   const blocks = await publishedBlocks(db);
   const best = await bestByUser(db);
   const cell = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  const lines = [['Telegram ID', 'Имя', 'Username', 'Должность', ...blocks.map(b => b.title), 'Пройдено блоков', 'Последняя активность'].map(cell).join(';')];
-  for (const u of await db.all('SELECT * FROM users ORDER BY first_name')) {
-    const r = best[u.tg_id] || {};
+  const lines = [['Имя', 'Логин', 'Должность', 'Роль', ...blocks.map(b => b.title), 'Пройдено блоков', 'Последняя активность'].map(cell).join(';')];
+  for (const u of await db.all(`SELECT * FROM accounts WHERE ${STAFF} ORDER BY name`)) {
+    const r = best[u.id] || {};
     lines.push([
-      u.tg_id, userName(u), u.username ? '@' + u.username : '', u.position,
+      displayName(u), u.login, u.position, ROLE_TITLES[u.role],
       ...blocks.map(b => r[b.id] ? `${r[b.id].best}%${r[b.id].passed ? ' ✓' : ''}` : '—'),
-      `${blocks.filter(b => r[b.id]?.passed).length}/${blocks.length}`, u.last_seen
+      `${blocks.filter(b => r[b.id]?.passed).length}/${blocks.length}`, u.last_seen || ''
     ].map(cell).join(';'));
   }
   return new Response('﻿' + lines.join('\r\n'), { headers: { 'Content-Type': 'text/csv; charset=utf-8' } });
@@ -510,21 +597,21 @@ route('GET', '/api/admin/export/results.csv', 'admin', async ({ db }) => {
 
 // --- кабинет: контент ---
 
-route('GET', '/api/admin/blocks', 'admin', ({ db }) => db.all(`
+route('GET', '/api/admin/blocks', 'manager', ({ db }) => db.all(`
   SELECT b.*,
     (SELECT COUNT(*) FROM lessons WHERE block_id = b.id) AS lessons_count,
     (SELECT COUNT(*) FROM questions WHERE block_id = b.id) AS questions_count,
     (SELECT COUNT(DISTINCT user_id) FROM attempts WHERE block_id = b.id AND passed = 1) AS passed_users
   FROM blocks b ORDER BY sort, id`));
 
-route('POST', '/api/admin/blocks', 'admin', async ({ db, body }) => {
+route('POST', '/api/admin/blocks', 'manager', async ({ db, body }) => {
   const data = pick(body, BLOCK_FIELDS);
   if (!data.title) throw new HttpError(400, 'Укажите название блока');
   const id = await db.insert('blocks', { ...data, sort: await nextSort(db, 'blocks') });
   return db.first('SELECT * FROM blocks WHERE id = ?', id);
 });
 
-route('GET', '/api/admin/blocks/:id', 'admin', async ({ db, params }) => {
+route('GET', '/api/admin/blocks/:id', 'manager', async ({ db, params }) => {
   const block = await db.first('SELECT * FROM blocks WHERE id = ?', Number(params.id));
   if (!block) throw new HttpError(404, 'Блок не найден');
   return {
@@ -534,12 +621,12 @@ route('GET', '/api/admin/blocks/:id', 'admin', async ({ db, params }) => {
   };
 });
 
-route('PUT', '/api/admin/blocks/:id', 'admin', async ({ db, params, body }) => {
-  await db.update('blocks', Number(params.id), { ...pick(body, BLOCK_FIELDS), updated_at: new Date().toISOString().replace('T', ' ').slice(0, 19) });
+route('PUT', '/api/admin/blocks/:id', 'manager', async ({ db, params, body }) => {
+  await db.update('blocks', Number(params.id), { ...pick(body, BLOCK_FIELDS), updated_at: sqlNow() });
   return db.first('SELECT * FROM blocks WHERE id = ?', Number(params.id));
 });
 
-route('DELETE', '/api/admin/blocks/:id', 'admin', async ({ db, params }) => {
+route('DELETE', '/api/admin/blocks/:id', 'manager', async ({ db, params }) => {
   const id = Number(params.id);
   await db.batch([
     db.stmt('DELETE FROM lessons WHERE block_id = ?', id),
@@ -549,112 +636,78 @@ route('DELETE', '/api/admin/blocks/:id', 'admin', async ({ db, params }) => {
   return { ok: true };
 });
 
-route('POST', '/api/admin/blocks/:id/lessons', 'admin', async ({ db, params, body }) => {
+route('POST', '/api/admin/blocks/:id/lessons', 'manager', async ({ db, params, body }) => {
   const blockId = Number(params.id);
   const id = await db.insert('lessons', { ...pick(body, LESSON_FIELDS), block_id: blockId, sort: await nextSort(db, 'lessons', 'WHERE block_id = ?', blockId) });
   return db.first('SELECT * FROM lessons WHERE id = ?', id);
 });
-route('PUT', '/api/admin/lessons/:id', 'admin', async ({ db, params, body }) => {
+route('PUT', '/api/admin/lessons/:id', 'manager', async ({ db, params, body }) => {
   await db.update('lessons', Number(params.id), pick(body, LESSON_FIELDS));
   return db.first('SELECT * FROM lessons WHERE id = ?', Number(params.id));
 });
-route('DELETE', '/api/admin/lessons/:id', 'admin', async ({ db, params }) => {
+route('DELETE', '/api/admin/lessons/:id', 'manager', async ({ db, params }) => {
   await db.run('DELETE FROM lessons WHERE id = ?', Number(params.id));
   return { ok: true };
 });
 
-route('POST', '/api/admin/blocks/:id/questions', 'admin', async ({ db, params, body }) => {
+route('POST', '/api/admin/blocks/:id/questions', 'manager', async ({ db, params, body }) => {
   const blockId = Number(params.id);
   const data = normalizeQuestion(body);
   if (!data.text) throw new HttpError(400, 'Укажите текст вопроса');
   const id = await db.insert('questions', { ...data, block_id: blockId, sort: await nextSort(db, 'questions', 'WHERE block_id = ?', blockId) });
   return parseQ(await db.first('SELECT * FROM questions WHERE id = ?', id));
 });
-route('PUT', '/api/admin/questions/:id', 'admin', async ({ db, params, body }) => {
+route('PUT', '/api/admin/questions/:id', 'manager', async ({ db, params, body }) => {
   await db.update('questions', Number(params.id), normalizeQuestion(body));
   return parseQ(await db.first('SELECT * FROM questions WHERE id = ?', Number(params.id)));
 });
-route('DELETE', '/api/admin/questions/:id', 'admin', async ({ db, params }) => {
+route('DELETE', '/api/admin/questions/:id', 'manager', async ({ db, params }) => {
   await db.run('DELETE FROM questions WHERE id = ?', Number(params.id));
   return { ok: true };
 });
 
-route('GET', '/api/admin/refs', 'admin', async ({ db }) => {
+route('GET', '/api/admin/refs', 'manager', async ({ db }) => {
   const cats = await db.all('SELECT * FROM ref_categories ORDER BY sort, id');
   const items = await db.all('SELECT * FROM ref_items ORDER BY sort, id');
   return cats.map(c => ({ ...c, items: items.filter(i => i.category_id === c.id) }));
 });
-route('POST', '/api/admin/ref-categories', 'admin', async ({ db, body }) => {
+route('POST', '/api/admin/ref-categories', 'manager', async ({ db, body }) => {
   const data = pick(body, CATEGORY_FIELDS);
   if (!data.title) throw new HttpError(400, 'Укажите название');
   return { id: await db.insert('ref_categories', { ...data, sort: await nextSort(db, 'ref_categories') }) };
 });
-route('PUT', '/api/admin/ref-categories/:id', 'admin', async ({ db, params, body }) => {
+route('PUT', '/api/admin/ref-categories/:id', 'manager', async ({ db, params, body }) => {
   await db.update('ref_categories', Number(params.id), pick(body, CATEGORY_FIELDS));
   return { ok: true };
 });
-route('DELETE', '/api/admin/ref-categories/:id', 'admin', async ({ db, params }) => {
+route('DELETE', '/api/admin/ref-categories/:id', 'manager', async ({ db, params }) => {
   const id = Number(params.id);
   await db.batch([db.stmt('DELETE FROM ref_items WHERE category_id = ?', id), db.stmt('DELETE FROM ref_categories WHERE id = ?', id)]);
   return { ok: true };
 });
-route('POST', '/api/admin/ref-categories/:id/items', 'admin', async ({ db, params, body }) => {
+route('POST', '/api/admin/ref-categories/:id/items', 'manager', async ({ db, params, body }) => {
   const catId = Number(params.id);
   const data = pick(body, ITEM_FIELDS);
   if (!data.title) throw new HttpError(400, 'Укажите название');
   return { id: await db.insert('ref_items', { ...data, category_id: catId, sort: await nextSort(db, 'ref_items', 'WHERE category_id = ?', catId) }) };
 });
-route('PUT', '/api/admin/ref-items/:id', 'admin', async ({ db, params, body }) => {
+route('PUT', '/api/admin/ref-items/:id', 'manager', async ({ db, params, body }) => {
   await db.update('ref_items', Number(params.id), pick(body, ITEM_FIELDS));
   return { ok: true };
 });
-route('DELETE', '/api/admin/ref-items/:id', 'admin', async ({ db, params }) => {
+route('DELETE', '/api/admin/ref-items/:id', 'manager', async ({ db, params }) => {
   await db.run('DELETE FROM ref_items WHERE id = ?', Number(params.id));
   return { ok: true };
 });
 
-route('POST', '/api/admin/reorder/:kind', 'admin', async ({ db, params, body }) => {
+route('POST', '/api/admin/reorder/:kind', 'manager', async ({ db, params, body }) => {
   const table = REORDERABLE[params.kind];
   if (!table || !Array.isArray(body.ids)) throw new HttpError(400, 'Bad request');
   if (body.ids.length) await db.batch(body.ids.map((id, i) => db.stmt(`UPDATE ${table} SET sort = ? WHERE id = ?`, i, Number(id))));
   return { ok: true };
 });
 
-// --- кабинет: настройки, менеджеры, загрузка, импорт, бот ---
-
-route('GET', '/api/admin/settings', 'admin', async ({ db }) =>
-  Object.fromEntries(Object.entries(await getSettings(db)).filter(([k]) => !k.startsWith('_'))));
-
-route('PUT', '/api/admin/settings', 'admin', async ({ db, body }) => {
-  const stmts = Object.entries(body || {}).filter(([k]) => !k.startsWith('_')).map(([k, v]) =>
-    db.stmt('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', k, String(v)));
-  if (stmts.length) await db.batch(stmts);
-  return { ok: true };
-});
-
-route('GET', '/api/admin/admins', 'admin', async ({ db, env }) => {
-  const list = await db.all('SELECT a.*, u.first_name, u.last_name, u.username, u.photo_url FROM admins a LEFT JOIN users u ON u.tg_id = a.tg_id');
-  const owners = [];
-  for (const id of envAdminIds(env).filter(id => !list.some(a => a.tg_id === id))) {
-    const u = (await db.first('SELECT * FROM users WHERE tg_id = ?', id)) || {};
-    owners.push({ tg_id: id, name: 'Владелец', locked: true, first_name: u.first_name, last_name: u.last_name, username: u.username, photo_url: u.photo_url });
-  }
-  return [...owners, ...list];
-});
-route('POST', '/api/admin/admins', 'admin', async ({ db, body }) => {
-  const id = Number(String(body.tg_id || '').trim());
-  if (!Number.isInteger(id) || id <= 0) throw new HttpError(400, 'Укажите числовой Telegram ID');
-  await db.run('INSERT OR REPLACE INTO admins (tg_id, name) VALUES (?, ?)', id, String(body.name || ''));
-  return { ok: true };
-});
-route('DELETE', '/api/admin/admins/:id', 'admin', async ({ db, params, admin }) => {
-  const id = Number(params.id);
-  if (id === Number(admin.id)) throw new HttpError(400, 'Нельзя удалить самого себя');
-  await db.run('DELETE FROM admins WHERE tg_id = ?', id);
-  return { ok: true };
-});
-
-route('POST', '/api/admin/upload', 'admin', async ({ env, request, url }) => {
+route('POST', '/api/admin/upload', 'manager', async ({ env, request, url }) => {
   const form = await request.formData();
   const file = form.get('file');
   if (!file || typeof file === 'string' || !/^image\/(png|jpe?g|webp|gif)$/.test(file.type)) {
@@ -666,11 +719,27 @@ route('POST', '/api/admin/upload', 'admin', async ({ env, request, url }) => {
   return { url: `${url.origin}/img/${key}` };
 });
 
+// --- кабинет: настройки, импорт, бот (только администратор) ---
+
+route('GET', '/api/admin/settings', 'admin', async ({ db }) =>
+  Object.fromEntries(Object.entries(await getSettings(db)).filter(([k]) => !k.startsWith('_'))));
+
+route('PUT', '/api/admin/settings', 'admin', async ({ db, body }) => {
+  const stmts = Object.entries(body || {}).filter(([k]) => !k.startsWith('_')).map(([k, v]) =>
+    db.stmt('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', k, String(v)));
+  if (stmts.length) await db.batch(stmts);
+  return { ok: true };
+});
+
 route('POST', '/api/admin/import/sheets', 'admin', async ({ env, body }) => {
   const match = String(body.sheet || '').match(/[-\w]{25,}/);
   if (!match) throw new HttpError(400, 'Вставьте ссылку на таблицу или её ID');
   return importFromSheets(env.DB, match[0], { replace: !!body.replace });
 });
+
+// Те же листы, уже разобранные из Excel-файла в JSON: { texts, questions, menu, wine, allergens }
+route('POST', '/api/admin/import/content', 'admin', async ({ env, body }) =>
+  importContent(env.DB, body.data || {}, { replace: !!body.replace }));
 
 const webhookSecret = secret => crypto.createHmac('sha256', secret).update('tg-webhook').digest('hex').slice(0, 48);
 
@@ -682,16 +751,15 @@ route('POST', '/api/admin/bot/setup', 'admin', async ({ env, url, secret }) => {
   await botApi(env.BOT_TOKEN, 'setChatMenuButton', { menu_button: { type: 'web_app', text: 'Обучение', web_app: { url: `${webapp}/` } } });
   await botApi(env.BOT_TOKEN, 'setMyCommands', { commands: [
     { command: 'start', description: 'Начать обучение' },
-    { command: 'admin', description: 'Кабинет менеджера' },
-    { command: 'id', description: 'Узнать свой Telegram ID' }
+    { command: 'admin', description: 'Кабинет менеджера' }
   ] });
   const me = await botApi(env.BOT_TOKEN, 'getMe');
   return { ok: true, bot: me.username, webapp };
 });
 
-// --- вебхук бота ---
+// --- вебхук бота: открывает приложение, вход по логину и паролю уже внутри ---
 
-route('POST', '/bot', null, async ({ env, db, request, body, secret, isAdmin }) => {
+route('POST', '/bot', null, async ({ env, db, request, body, secret }) => {
   if (request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== webhookSecret(secret)) throw new HttpError(403, 'Forbidden');
   const msg = body.message;
   if (!msg?.text) return { ok: true };
@@ -706,19 +774,13 @@ route('POST', '/bot', null, async ({ env, db, request, body, secret, isAdmin }) 
       reply_markup: { inline_keyboard: [[{ text: '🎓 Начать обучение', web_app: { url: `${webapp}/` } }]] }
     });
   } else if (text.startsWith('/admin')) {
-    if (!(await isAdmin(msg.from.id))) {
-      await send({ text: `Ваш Telegram ID: ${msg.from.id}\nПередайте его владельцу, чтобы получить доступ к кабинету.` });
-    } else {
-      await send({
-        text: '🗂 Кабинет менеджера',
-        reply_markup: { inline_keyboard: [
-          [{ text: '📱 Открыть здесь', web_app: { url: `${webapp}/admin/` } }],
-          [{ text: '💻 Открыть в браузере', url: `${webapp}/admin/` }]
-        ] }
-      });
-    }
-  } else if (text.startsWith('/id')) {
-    await send({ text: `Ваш Telegram ID: ${msg.from.id}` });
+    await send({
+      text: '🗂 Кабинет менеджера — вход по логину и паролю',
+      reply_markup: { inline_keyboard: [
+        [{ text: '📱 Открыть здесь', web_app: { url: `${webapp}/admin/` } }],
+        [{ text: '💻 Открыть в браузере', url: `${webapp}/admin/` }]
+      ] }
+    });
   }
   return { ok: true };
 });
@@ -738,11 +800,13 @@ function corsHeaders(request, env) {
   return allowed ? {
     'Access-Control-Allow-Origin': allowed,
     'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Telegram-Init-Data, X-Dev-User',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin'
   } : { Vary: 'Origin' };
 }
+
+const AUTH_LEVEL = { user: ['waiter', 'manager', 'admin'], manager: ['manager', 'admin'], admin: ['admin'] };
 
 async function handle(request, env, ctx) {
   const url = new URL(request.url);
@@ -762,35 +826,25 @@ async function handle(request, env, ctx) {
   }
 
   const db = makeDb(env.DB);
-  await seedIfEmpty(db);
+  await ensureSeed(db);
   const secret = await sessionSecret(env, db);
-  let ids = null;
-  const isAdmin = async id => (ids ||= await adminIds(env, db)).includes(Number(id));
 
-  const c = { request, env, ctx, url, params, query: url.searchParams, db, secret, isAdmin, body: {} };
+  const c = { request, env, ctx, url, params, query: url.searchParams, db, secret, body: {} };
   const type = request.headers.get('Content-Type') || '';
   if (request.method !== 'GET' && type.includes('application/json')) c.body = await request.json().catch(() => ({}));
 
-  const bearer = (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '');
-  if (r.auth === 'user') {
-    let tgUser = verifyWebAppInitData(env.BOT_TOKEN, request.headers.get('X-Telegram-Init-Data'));
-    if (!tgUser && bearer) {
-      const session = unsign(secret, bearer);
-      if (session?.kind === 'user') tgUser = session.u;
+  if (r.auth) {
+    const token = (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '');
+    const session = unsign(secret, token);
+    const account = session?.kind === 'acc' ? await db.first('SELECT * FROM accounts WHERE id = ?', session.id) : null;
+    // token_version меняется при смене пароля или роли — старые сессии перестают действовать
+    if (!account || (account.token_version || 0) !== session.v) throw new HttpError(401, 'Войдите в систему');
+    if (!AUTH_LEVEL[r.auth].includes(account.role)) throw new HttpError(403, 'Недостаточно прав');
+    if (account.must_change_password && !['/api/auth/password', '/api/auth/me'].includes(url.pathname)) {
+      throw new HttpError(403, 'Сначала смените пароль');
     }
-    if (!tgUser && env.DEV_MODE === '1') {
-      tgUser = { id: 100001, first_name: 'Тестовый', last_name: 'Сотрудник', username: 'test_user' };
-      try { const d = request.headers.get('X-Dev-User'); if (d) tgUser = JSON.parse(d); } catch {}
-    }
-    if (!tgUser) throw new HttpError(401, 'Войдите через Telegram');
-    c.user = await upsertUser(db, tgUser);
-  } else if (r.auth === 'admin') {
-    const session = unsign(secret, bearer);
-    // Токен сотрудника не даёт доступа к кабинету, даже если сотрудник — менеджер
-    if (!session || session.kind === 'user' || !((await isAdmin(session.id)) || (env.DEV_MODE === '1' && session.id === 1))) {
-      throw new HttpError(401, 'Требуется вход');
-    }
-    c.admin = session;
+    c.account = account;
+    ctx.waitUntil(db.run("UPDATE accounts SET last_seen = datetime('now') WHERE id = ? AND (last_seen IS NULL OR last_seen < datetime('now', '-5 minutes'))", account.id));
   }
 
   const result = await r.handler(c);

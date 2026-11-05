@@ -3,6 +3,7 @@ tg?.ready();
 tg?.expand();
 
 const $ = id => document.getElementById(id);
+const $$ = sel => [...document.querySelectorAll(sel)];
 let state = null;          // ответ /api/app
 let lesson = null;         // { block, lessons, index }
 let test = null;           // { blockId, attemptId, questions, index, answered, correct }
@@ -21,16 +22,27 @@ function formatText(s) {
     .replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
 }
 
-// Внутри Telegram пользователя подтверждает initData, в браузере — токен после входа через Telegram
-const inTelegram = !!tg?.initData;
+// Сессия: с галочкой «Не выходить» токен хранится в localStorage (30 дней),
+// без неё — в sessionStorage и пропадает при закрытии вкладки
 const session = {
-  get: () => { try { return localStorage.getItem('user_token'); } catch { return null; } },
-  set: t => { try { t ? localStorage.setItem('user_token', t) : localStorage.removeItem('user_token'); } catch {} }
+  get() {
+    try { return localStorage.getItem('auth_token') || sessionStorage.getItem('auth_token'); } catch { return null; }
+  },
+  remembered() {
+    try { return !!localStorage.getItem('auth_token'); } catch { return false; }
+  },
+  set(token, remember) {
+    try {
+      localStorage.removeItem('auth_token');
+      sessionStorage.removeItem('auth_token');
+      if (token) (remember ? localStorage : sessionStorage).setItem('auth_token', token);
+    } catch {}
+  }
 };
 
 async function api(path, options = {}) {
-  const headers = { 'Content-Type': 'application/json', 'X-Telegram-Init-Data': tg?.initData || '' };
-  if (!inTelegram && session.get()) headers.Authorization = `Bearer ${session.get()}`;
+  const headers = { 'Content-Type': 'application/json' };
+  if (session.get()) headers.Authorization = `Bearer ${session.get()}`;
   const res = await fetch(window.APP_CONFIG.API_URL + '/api' + path, {
     ...options,
     headers: { ...headers, ...options.headers },
@@ -130,7 +142,7 @@ function render() {
   const { settings, user, blocks, history } = state;
   document.title = settings.app_title;
   $('appTitle').textContent = settings.app_title;
-  $('hello').innerHTML = `<b>Привет, ${esc(user.first_name || 'коллега')}! 👋</b>${esc(settings.welcome_text)}`;
+  $('hello').innerHTML = `<b>Привет, ${esc((user.name || '').split(' ')[0] || 'коллега')}! 👋</b>${esc(settings.welcome_text)}`;
 
   const passed = blocks.filter(b => b.status === 'passed').length;
   const percent = blocks.length ? Math.round((passed / blocks.length) * 100) : 0;
@@ -181,7 +193,7 @@ function render() {
 
 function certificateHtml() {
   const { settings, user, blocks } = state;
-  const name = [user.first_name, user.last_name].filter(Boolean).join(' ') || 'Южанин';
+  const name = user.name || 'Южанин';
   const avg = Math.round(blocks.reduce((s, b) => s + (b.best || 0), 0) / blocks.length);
   return `
     <div class="certificate">
@@ -252,11 +264,11 @@ $('refSearch').addEventListener('input', renderReferences);
 
 function renderProfile() {
   const { user, blocks, history, isAdmin } = state;
-  $('profileName').textContent = [user.first_name, user.last_name].filter(Boolean).join(' ') || 'Сотрудник';
-  $('profileSub').textContent = [user.position, user.username ? '@' + user.username : '', `ID ${user.tg_id}`].filter(Boolean).join(' · ');
-  $('profileAvatar').innerHTML = user.photo_url ? `<img src="${esc(user.photo_url)}" alt="">` : '<i class="fas fa-user"></i>';
+  $('profileName').textContent = user.name || user.login;
+  $('profileSub').textContent = [user.position, `логин: ${user.login}`].filter(Boolean).join(' · ');
+  const initials = (user.name || user.login).split(' ').map(s => s[0]).join('').slice(0, 2).toUpperCase();
+  $('profileAvatar').innerHTML = `<span style="font-weight:800">${esc(initials)}</span>`;
   $('adminLink').hidden = !isAdmin;
-  $('logoutBtn').hidden = inTelegram || !session.get();
 
   $('blockStats').innerHTML = blocks.map((b, i) => `
     <div class="item">
@@ -408,39 +420,86 @@ async function finishTest() {
 
 // ---------- init ----------
 
-function showLogin() {
-  $('loading').classList.remove('hidden');
-  document.querySelector('.loading-icon').style.animation = 'none';
-  document.querySelector('.loading-text').textContent = 'Обучение «Южане»';
-  $('loadingError').innerHTML = '';
-  $('loginBox').hidden = false;
-  if ($('loginWidget').childElementCount) return;
-  fetch(window.APP_CONFIG.API_URL + '/api/admin/config').then(r => r.json()).then(cfg => {
-    if (!cfg.bot_username) {
-      $('loginError').textContent = 'Бот ещё не настроен.';
-      return;
-    }
-    const s = document.createElement('script');
-    s.async = true;
-    s.src = 'https://telegram.org/js/telegram-widget.js?22';
-    s.dataset.telegramLogin = cfg.bot_username;
-    s.dataset.size = 'large';
-    s.dataset.radius = '12';
-    s.dataset.onauth = 'onTelegramAuth(user)';
-    $('loginWidget').appendChild(s);
-  }).catch(() => ($('loginError').textContent = 'Сервер недоступен, попробуйте позже.'));
+// Экран входа: режимы login / register / change (смена пароля)
+let authMode = 'login';
+let pendingOldPassword = '';   // временный пароль, выданный менеджером, — чтобы не спрашивать его дважды
+let allowRegistration = true;
+
+const AUTH_TEXT = {
+  login: { title: 'Обучение «Южане»', sub: 'Войдите, чтобы продолжить обучение', submit: 'Войти', pw: 'Пароль' },
+  register: { title: 'Регистрация', sub: 'Создайте учётную запись сотрудника', submit: 'Зарегистрироваться', pw: 'Пароль (не короче 6 символов)' },
+  change: { title: 'Смена пароля', sub: 'Придумайте новый пароль', submit: 'Сохранить пароль', pw: 'Новый пароль' }
+};
+
+function showAuth(mode = 'login', { cancellable = false, message = '' } = {}) {
+  authMode = mode;
+  const f = $('authForm');
+  const t = AUTH_TEXT[mode];
+  $('authTitle').textContent = t.title;
+  $('authSub').textContent = message || t.sub;
+  $('authSubmit').textContent = t.submit;
+  $('pwLabel').textContent = t.pw;
+  $('authTabs').hidden = mode === 'change' || !allowRegistration;
+  $$('#authTabs button').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+  f.querySelectorAll('[data-for]').forEach(el => {
+    const show = el.dataset.for.split(' ').includes(mode) && !(el.querySelector('[name=old_password]') && pendingOldPassword);
+    el.hidden = !show;
+  });
+  f.password.autocomplete = mode === 'login' ? 'current-password' : 'new-password';
+  $('authError').textContent = '';
+  $('authCancel').hidden = !cancellable;
+  $('auth').hidden = false;
+  $('loading').classList.add('hidden');
+  setTimeout(() => (mode === 'change' ? (pendingOldPassword ? f.password : f.old_password) : mode === 'register' ? f.name : f.login).focus(), 50);
 }
 
-window.onTelegramAuth = async user => {
-  $('loginError').textContent = '';
+function hideAuth() {
+  $('auth').hidden = true;
+  $('authForm').reset();
+  pendingOldPassword = '';
+}
+
+$$('#authTabs button').forEach(b => (b.onclick = () => showAuth(b.dataset.mode)));
+$('authCancel').onclick = hideAuth;
+document.querySelector('.pw-toggle').onclick = e => {
+  const input = $('authForm').password;
+  input.type = input.type === 'password' ? 'text' : 'password';
+  e.currentTarget.innerHTML = `<i class="fas fa-eye${input.type === 'password' ? '' : '-slash'}"></i>`;
+};
+
+$('authForm').onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target;
+  const v = {
+    name: f.name.value.trim(), login: f.login.value.trim(), password: f.password.value,
+    password2: f.password2.value, old_password: pendingOldPassword || f.old_password.value, remember: f.remember.checked
+  };
+  const error = msg => { $('authError').textContent = msg; };
+  if (authMode !== 'login' && v.password !== v.password2) return error('Пароли не совпадают');
+  if (authMode === 'register' && !v.name) return error('Укажите имя и фамилию');
+  if (authMode !== 'change' && (!v.login || !v.password)) return error('Введите логин и пароль');
+  $('authSubmit').disabled = true;
   try {
-    const { token } = await api('/auth/telegram', { method: 'POST', body: user });
-    session.set(token);
-    $('loginBox').hidden = true;
-    document.querySelector('.loading-text').textContent = 'Загрузка обучения...';
+    if (authMode === 'change') {
+      const r = await api('/auth/password', { method: 'POST', body: { old_password: v.old_password, new_password: v.password, remember: session.remembered() } });
+      session.set(r.token, r.remember);
+      hideAuth();
+      toast('Пароль изменён');
+    } else {
+      const r = await api(`/auth/${authMode}`, { method: 'POST', body: v });
+      session.set(r.token, r.remember);
+      if (r.account.must_change_password) {
+        pendingOldPassword = v.password;
+        return showAuth('change', { message: 'Пароль был выдан менеджером — придумайте свой' });
+      }
+      hideAuth();
+    }
+    $('loading').classList.remove('hidden');
     await init();
-  } catch (e) {
-    $('loginError').textContent = e.message;
+  } catch (err) {
+    error(err.message);
+  } finally {
+    $('authSubmit').disabled = false;
   }
 };
 
@@ -448,17 +507,24 @@ $('logoutBtn').onclick = () => {
   session.set(null);
   location.reload();
 };
+$('passwordBtn').onclick = () => showAuth('change', { cancellable: true });
 
 async function init() {
+  if (!session.get()) {
+    fetch(window.APP_CONFIG.API_URL + '/api/config').then(r => r.json())
+      .then(cfg => { allowRegistration = cfg.allow_registration; $('authTabs').hidden = !allowRegistration; }).catch(() => {});
+    return showAuth('login');
+  }
   try {
     state = await api('/app');
     render();
     $('loading').classList.add('hidden');
   } catch (e) {
-    if (e.status === 401 && !inTelegram) {
+    if (e.status === 401) {
       session.set(null);
-      return showLogin();
+      return showAuth('login', { message: 'Сессия закончилась — войдите снова' });
     }
+    if (e.status === 403 && /пароль/i.test(e.message)) return showAuth('change', { message: 'Придумайте новый пароль, чтобы продолжить' });
     $('loadingError').innerHTML = `${esc(e.message)}
       <br><button class="btn btn-primary" onclick="location.reload()"><i class="fas fa-rotate-right"></i> Попробовать снова</button>`;
   }

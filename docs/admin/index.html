@@ -13,14 +13,25 @@
 <body>
 
 <div id="login" class="login" hidden>
-  <div class="login-card">
+  <form class="login-card" id="loginForm" novalidate>
     <div class="login-logo"><i class="fas fa-utensils"></i></div>
-    <h1>Кабинет менеджера</h1>
-    <p class="muted">Обучение сотрудников «Южане»</p>
-    <div id="loginWidget" class="login-widget"></div>
+    <h1 id="loginTitle">Кабинет менеджера</h1>
+    <p class="muted" id="loginSub">Обучение сотрудников «Южане»</p>
+    <div class="login-fields">
+      <label class="field" data-step="login"><span>Логин</span>
+        <input type="text" name="login" autocomplete="username" autocapitalize="none" spellcheck="false"></label>
+      <label class="field" data-step="login"><span>Пароль</span>
+        <input type="password" name="password" autocomplete="current-password"></label>
+      <label class="check" data-step="login"><input type="checkbox" name="remember"> Не выходить</label>
+      <label class="field" data-step="change" hidden><span>Новый пароль</span>
+        <input type="password" name="new_password" autocomplete="new-password" placeholder="Не короче 6 символов"></label>
+      <label class="field" data-step="change" hidden><span>Повторите новый пароль</span>
+        <input type="password" name="new_password2" autocomplete="new-password"></label>
+    </div>
     <div id="loginError" class="login-error"></div>
-    <p class="muted small" id="loginHint"></p>
-  </div>
+    <button class="btn btn-primary login-submit" type="submit" id="loginSubmit">Войти</button>
+    <p class="muted small" id="loginHint">Учётную запись выдаёт администратор. Сотрудники входят в <a href="../">приложение обучения</a>.</p>
+  </form>
 </div>
 
 <div id="shell" class="shell" hidden>
@@ -33,13 +44,14 @@
       <div class="menu-label">Контент</div>
       <a href="#/content" data-route="content"><i class="fas fa-layer-group"></i>Блоки и тесты</a>
       <a href="#/refs" data-route="refs"><i class="fas fa-book-open"></i>Справочники</a>
-      <div class="menu-label">Система</div>
-      <a href="#/settings" data-route="settings"><i class="fas fa-gear"></i>Настройки</a>
+      <div class="menu-label" data-admin-only>Система</div>
+      <a href="#/settings" data-route="settings" data-admin-only><i class="fas fa-gear"></i>Настройки</a>
     </nav>
     <div class="sidebar-foot">
       <div class="me" id="me"></div>
       <div class="sidebar-actions">
         <button class="icon-btn" id="themeBtn" title="Тема"><i class="fas fa-moon"></i></button>
+        <button class="icon-btn" id="passwordBtn" title="Сменить пароль"><i class="fas fa-key"></i></button>
         <button class="icon-btn" id="logoutBtn" title="Выйти"><i class="fas fa-arrow-right-from-bracket"></i></button>
       </div>
     </div>

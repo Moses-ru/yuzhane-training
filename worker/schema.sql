@@ -3,12 +3,6 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT
 );
 
-CREATE TABLE IF NOT EXISTS admins (
-  tg_id    INTEGER PRIMARY KEY,
-  name     TEXT DEFAULT '',
-  added_at TEXT DEFAULT (datetime('now'))
-);
-
 CREATE TABLE IF NOT EXISTS blocks (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   title        TEXT NOT NULL,
@@ -58,23 +52,29 @@ CREATE TABLE IF NOT EXISTS ref_items (
   sort        INTEGER DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS users (
-  tg_id      INTEGER PRIMARY KEY,
-  first_name TEXT DEFAULT '',
-  last_name  TEXT DEFAULT '',
-  username   TEXT DEFAULT '',
-  photo_url  TEXT DEFAULT '',
-  position   TEXT DEFAULT '',
-  note       TEXT DEFAULT '',
-  first_seen TEXT DEFAULT (datetime('now')),
-  last_seen  TEXT DEFAULT (datetime('now'))
+-- Учётные записи: waiter — сотрудник, manager — правит контент и видит результаты,
+-- admin — всё, плюс назначает роли и настройки
+CREATE TABLE IF NOT EXISTS accounts (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  login                TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  password_hash        TEXT NOT NULL,
+  name                 TEXT DEFAULT '',
+  role                 TEXT NOT NULL DEFAULT 'waiter',
+  position             TEXT DEFAULT '',
+  note                 TEXT DEFAULT '',
+  must_change_password INTEGER DEFAULT 0,
+  token_version        INTEGER DEFAULT 0,
+  failed_logins        INTEGER DEFAULT 0,
+  locked_until         TEXT,
+  created_at           TEXT DEFAULT (datetime('now')),
+  last_seen            TEXT
 );
 
 -- Попытки хранят снимок названия блока и текстов вопросов,
 -- чтобы история не ломалась при редактировании контента.
 CREATE TABLE IF NOT EXISTS attempts (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id      INTEGER NOT NULL REFERENCES users(tg_id) ON DELETE CASCADE,
+  user_id      INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   block_id     INTEGER NOT NULL,
   block_title  TEXT DEFAULT '',
   pass_percent INTEGER DEFAULT 80,
@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS attempt_answers (
 );
 
 CREATE TABLE IF NOT EXISTS lesson_views (
-  user_id   INTEGER NOT NULL REFERENCES users(tg_id) ON DELETE CASCADE,
+  user_id   INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   lesson_id INTEGER NOT NULL,
   viewed_at TEXT DEFAULT (datetime('now')),
   PRIMARY KEY (user_id, lesson_id)
@@ -111,6 +111,7 @@ INSERT OR IGNORE INTO settings (key, value) VALUES
   ('app_title', 'Южане Обучение'),
   ('welcome_text', 'Пройди все блоки обучения и стань настоящим Южанином!'),
   ('sequential', '1'),
+  ('allow_registration', '1'),
   ('certificate_title', 'СЕРТИФИКАТ'),
   ('certificate_text', 'Прошёл все блоки обучения и стал настоящим ЮЖАНИНОМ'),
   ('certificate_signature', 'Дато, основатель'),

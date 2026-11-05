@@ -1,4 +1,5 @@
-// Разовый перенос контента из старой Google-таблицы (листы Texts, Questions, Menu, Wine, Allergens).
+// Импорт контента в формате старого проекта: листы Texts, Questions, Menu, Wine, Allergens.
+// Источник — Google-таблица (по ссылке) или те же листы, уже разобранные в JSON (из Excel-файла).
 
 function parseCSV(text) {
   const rows = [];
@@ -45,12 +46,21 @@ function parseCorrect(raw) {
   return Number.isNaN(n) ? 0 : n;
 }
 
-export async function importFromSheets(DB, sheetId, { replace }) {
+const str = v => String(v ?? '').trim();
+const num = v => Number(str(v)) || 0;
+
+export async function importFromSheets(DB, sheetId, opts) {
   const [texts, questions, menu, wine, allergens] = await Promise.all(
     ['Texts', 'Questions', 'Menu', 'Wine', 'Allergens'].map(n => fetchSheet(sheetId, n).catch(() => []))
   );
+  return importContent(DB, { texts, questions, menu, wine, allergens }, opts);
+}
+
+export async function importContent(DB, data, { replace }) {
+  const texts = Array.isArray(data.texts) ? data.texts : [];
+  const questions = Array.isArray(data.questions) ? data.questions : [];
   if (!texts.length && !questions.length) {
-    throw new Error('Не удалось прочитать листы Texts/Questions. Таблица должна быть открыта по ссылке.');
+    throw new Error('Не найдены уроки и вопросы (листы Texts/Questions). Таблица должна быть открыта по ссылке.');
   }
   const stats = { blocks: 0, lessons: 0, questions: 0, refs: 0 };
 
@@ -58,7 +68,8 @@ export async function importFromSheets(DB, sheetId, { replace }) {
     await DB.batch(['lessons', 'questions', 'blocks', 'ref_items', 'ref_categories'].map(t => DB.prepare(`DELETE FROM ${t}`)));
   }
 
-  const chapters = [...new Set([...texts, ...questions].map(r => parseInt(r.chapter, 10) || 1))].sort((a, b) => a - b);
+  const chapterOf = r => parseInt(str(r.chapter), 10) || 1;
+  const chapters = [...new Set([...texts, ...questions].map(chapterOf))].sort((a, b) => a - b);
   let sort = (await DB.prepare('SELECT COALESCE(MAX(sort), -1) + 1 AS s FROM blocks').first()).s;
   const blockIds = {};
   for (const ch of chapters) {
@@ -69,40 +80,50 @@ export async function importFromSheets(DB, sheetId, { replace }) {
     stats.blocks++;
   }
 
+  // Порядок внутри блока — по колонкам index / q_index, если они есть
+  const byIndex = key => (a, b) => chapterOf(a) - chapterOf(b) || num(a[key]) - num(b[key]);
   const stmts = [];
   const counters = {};
   const next = key => (counters[key] = (counters[key] ?? -1) + 1);
 
-  for (const r of texts) {
-    const ch = parseInt(r.chapter, 10) || 1;
-    if (!r.text) continue;
+  for (const r of [...texts].sort(byIndex('index'))) {
+    const ch = chapterOf(r);
+    if (!str(r.text)) continue;
     stmts.push(DB.prepare('INSERT INTO lessons (block_id, sort, title, text, image) VALUES (?, ?, ?, ?, ?)')
-      .bind(blockIds[ch], next(`l${ch}`), '', r.text, /^https?:/.test(r.image) ? r.image : ''));
+      .bind(blockIds[ch], next(`l${ch}`), '', str(r.text), /^https?:/.test(str(r.image)) ? str(r.image) : ''));
     stats.lessons++;
   }
-  for (const r of questions) {
-    const ch = parseInt(r.chapter, 10) || 1;
+  for (const r of [...questions].sort(byIndex('q_index'))) {
+    const ch = chapterOf(r);
     const options = [];
     for (let i = 1; i <= 10; i++) {
-      const opt = r[`option_${i}`] || r[`option${i}`];
-      if (opt && opt.trim()) options.push(opt.trim());
+      const opt = str(r[`option_${i}`] ?? r[`option${i}`]);
+      if (opt) options.push(opt);
     }
-    if (!r.question || options.length < 2) continue;
+    if (!str(r.question) || options.length < 2) continue;
     stmts.push(DB.prepare('INSERT INTO questions (block_id, sort, text, options, correct, explanation) VALUES (?, ?, ?, ?, ?, ?)')
-      .bind(blockIds[ch], next(`q${ch}`), r.question, JSON.stringify(options),
-        Math.min(parseCorrect(r.correct), options.length - 1), r.explanation || ''));
+      .bind(blockIds[ch], next(`q${ch}`), str(r.question), JSON.stringify(options),
+        Math.min(parseCorrect(r.correct), options.length - 1), str(r.explanation)));
     stats.questions++;
   }
-  if (stmts.length) await DB.batch(stmts);
+  // D1 ограничивает размер одного batch — отправляем частями
+  for (let i = 0; i < stmts.length; i += 50) await DB.batch(stmts.slice(i, i + 50));
 
   let refSort = (await DB.prepare('SELECT COALESCE(MAX(sort), -1) + 1 AS s FROM ref_categories').first()).s;
-  for (const [title, icon, rows] of [['Меню', '🍽️', menu], ['Вино', '🍷', wine], ['Аллергены', '⚠️', allergens]]) {
-    const items = rows.filter(r => r.key && r.value);
+  for (const [title, icon, rows] of [['Меню', '🍽️', data.menu], ['Вино', '🍷', data.wine], ['Аллергены', '⚠️', data.allergens]]) {
+    const items = (Array.isArray(rows) ? rows : []).filter(r => str(r.key) && str(r.value));
     if (!items.length) continue;
     const c = await DB.prepare('INSERT INTO ref_categories (title, icon, sort) VALUES (?, ?, ?)').bind(title, icon, refSort++).run();
-    await DB.batch(items.map((r, j) =>
-      DB.prepare('INSERT INTO ref_items (category_id, title, body, sort) VALUES (?, ?, ?, ?)').bind(c.meta.last_row_id, r.key, r.value, j)));
+    const itemStmts = items.map((r, j) =>
+      DB.prepare('INSERT INTO ref_items (category_id, title, body, sort) VALUES (?, ?, ?, ?)')
+        .bind(c.meta.last_row_id, capitalize(str(r.key)), str(r.value), j));
+    for (let i = 0; i < itemStmts.length; i += 50) await DB.batch(itemStmts.slice(i, i + 50));
     stats.refs += items.length;
   }
   return stats;
+}
+
+// В старой таблице ключи справочников написаны строчными («хинкали») — для поиска; в карточке показываем с заглавной
+function capitalize(s) {
+  return s.charAt(0).toUpperCase() + s.slice(1);
 }

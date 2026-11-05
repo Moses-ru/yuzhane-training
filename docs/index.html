@@ -16,11 +16,33 @@
   <div class="loading-icon"><i class="fas fa-graduation-cap"></i></div>
   <div class="loading-text">Загрузка обучения...</div>
   <div class="loading-error" id="loadingError"></div>
-  <div class="login-box" id="loginBox" hidden>
-    <p>Войдите через Telegram, чтобы проходить обучение с компьютера.<br>Результаты сохранятся в вашем профиле.</p>
-    <div id="loginWidget" class="login-widget"></div>
-    <div class="loading-error" id="loginError"></div>
-  </div>
+</div>
+
+<div class="auth" id="auth" hidden>
+  <form class="auth-card" id="authForm" novalidate>
+    <div class="auth-logo"><i class="fas fa-graduation-cap"></i></div>
+    <h1 id="authTitle">Обучение «Южане»</h1>
+    <p class="auth-sub" id="authSub">Войдите, чтобы продолжить обучение</p>
+    <div class="auth-tabs" id="authTabs">
+      <button type="button" data-mode="login" class="active">Вход</button>
+      <button type="button" data-mode="register">Регистрация</button>
+    </div>
+    <label class="auth-field" data-for="register"><span>Имя и фамилия</span>
+      <input type="text" name="name" autocomplete="name" placeholder="Анна Иванова"></label>
+    <label class="auth-field" data-for="login register"><span>Логин</span>
+      <input type="text" name="login" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="anna"></label>
+    <label class="auth-field" data-for="change"><span>Текущий пароль</span>
+      <input type="password" name="old_password" autocomplete="current-password"></label>
+    <label class="auth-field" data-for="login register change"><span id="pwLabel">Пароль</span>
+      <span class="pw"><input type="password" name="password" autocomplete="current-password">
+      <button type="button" class="pw-toggle" aria-label="Показать пароль"><i class="fas fa-eye"></i></button></span></label>
+    <label class="auth-field" data-for="register change"><span>Повторите пароль</span>
+      <input type="password" name="password2" autocomplete="new-password"></label>
+    <label class="remember" data-for="login register"><input type="checkbox" name="remember"> Не выходить</label>
+    <div class="auth-error" id="authError"></div>
+    <button class="btn btn-primary" type="submit" id="authSubmit">Войти</button>
+    <button class="btn btn-secondary" type="button" id="authCancel" hidden>Отмена</button>
+  </form>
 </div>
 
 <header>
@@ -67,7 +89,10 @@
       <div class="profile-name" id="profileName">Гость</div>
       <div class="profile-sub" id="profileSub"></div>
       <a class="btn btn-gold" id="adminLink" href="admin/" hidden><i class="fas fa-chart-line"></i> Кабинет менеджера</a>
-      <button class="btn btn-secondary" id="logoutBtn" style="margin-top:10px" hidden><i class="fas fa-arrow-right-from-bracket"></i> Выйти</button>
+      <div class="profile-actions">
+        <button class="btn btn-secondary" id="passwordBtn"><i class="fas fa-key"></i> Сменить пароль</button>
+        <button class="btn btn-secondary" id="logoutBtn"><i class="fas fa-arrow-right-from-bracket"></i> Выйти</button>
+      </div>
     </div>
     <h2 class="section-title"><i class="fas fa-chart-bar"></i> Результаты по блокам</h2>
     <div class="list" id="blockStats"></div>

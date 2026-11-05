@@ -45,7 +45,11 @@ img { max-width: 100%; display: block; }
 .login-card { background: var(--card); border-radius: 20px; padding: 40px 32px; width: 100%; max-width: 400px; text-align: center; box-shadow: 0 20px 60px rgba(0,0,0,.35); }
 .login-logo { width: 64px; height: 64px; border-radius: 18px; margin: 0 auto 18px; display: grid; place-items: center; font-size: 26px; color: #fff; background: linear-gradient(135deg, var(--wine), var(--wine-2)); }
 .login-card h1 { font-size: 22px; margin-bottom: 4px; }
-.login-widget { margin: 28px 0 12px; min-height: 48px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.login-fields { text-align: left; margin: 24px 0 4px; }
+.login-fields input[type=text], .login-fields input[type=password] { padding: 11px 13px; font-size: 15px; }
+.login-submit { width: 100%; padding: 12px; font-size: 15px; margin-top: 6px; }
+#loginHint { margin-top: 16px; line-height: 1.5; }
+.role-pill { font-size: 11px; }
 .login-error { color: var(--bad); margin: 8px 0; font-size: 13px; }
 
 /* shell */
@@ -182,7 +186,7 @@ tr.click:hover { background: var(--soft); }
 .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
 .field > span { font-size: 13px; font-weight: 600; }
 .field small { color: var(--muted); font-size: 12px; }
-input[type=text], input[type=number], input[type=search], select, textarea {
+input[type=text], input[type=password], input[type=number], input[type=search], select, textarea {
   width: 100%; padding: 9px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); outline: none; transition: border-color .15s, box-shadow .15s;
 }
 input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
