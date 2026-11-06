@@ -49,14 +49,16 @@ async function getSettings(db) {
   return out;
 }
 
+let cachedSecret = null;
 async function sessionSecret(env, db) {
   if (env.SESSION_SECRET) return env.SESSION_SECRET;
+  if (cachedSecret) return cachedSecret;
   let row = await db.first("SELECT value FROM settings WHERE key = '_session_secret'");
   if (!row) {
     await db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('_session_secret', ?)", crypto.randomBytes(32).toString('hex'));
     row = await db.first("SELECT value FROM settings WHERE key = '_session_secret'");
   }
-  return row.value;
+  return (cachedSecret = row.value);
 }
 
 function sign(secret, payload) {
@@ -135,14 +137,18 @@ async function ensureSeed(db) {
 const publishedBlocks = db => db.all('SELECT * FROM blocks WHERE published = 1 ORDER BY sort, id');
 
 // Статусы блоков для сотрудника: passed / available / locked
-async function blockStatuses(db, userId) {
-  const sequential = (await getSettings(db)).sequential === '1';
-  const rows = await db.all(`
-    SELECT block_id, MAX(percent) AS best, MAX(passed) AS passed, COUNT(*) AS attempts
-    FROM attempts WHERE user_id = ? AND finished_at IS NOT NULL GROUP BY block_id`, userId);
+async function blockStatuses(db, userId, settings) {
+  const [s, rows, blocks] = await Promise.all([
+    settings || getSettings(db),
+    db.all(`
+      SELECT block_id, MAX(percent) AS best, MAX(passed) AS passed, COUNT(*) AS attempts
+      FROM attempts WHERE user_id = ? AND finished_at IS NOT NULL GROUP BY block_id`, userId),
+    publishedBlocks(db)
+  ]);
+  const sequential = s.sequential === '1';
   const best = Object.fromEntries(rows.map(r => [r.block_id, r]));
   let prevPassed = true;
-  return (await publishedBlocks(db)).map(b => {
+  return blocks.map(b => {
     const r = best[b.id];
     const passed = !!(r && r.passed);
     const status = passed ? 'passed' : (!sequential || prevPassed ? 'available' : 'locked');
@@ -206,6 +212,15 @@ function issueSession(secret, account, remember) {
   };
 }
 
+// Для страницы проверки связи: отдаёт N КБ без обращения к базе
+route('GET', '/api/ping', null, ({ query }) => {
+  const kb = Math.min(Math.max(Number(query.get('kb')) || 0, 0), 256);
+  // Случайные данные не сжимаются — иначе 100 КБ превратятся в пару байт
+  return new Response(crypto.randomBytes(kb * 1024).toString('base64').slice(0, kb * 1024), {
+    headers: { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' }
+  });
+});
+
 route('GET', '/api/config', null, async ({ db }) => {
   const s = await getSettings(db);
   return { app_title: s.app_title, allow_registration: s.allow_registration !== '0' };
@@ -260,17 +275,21 @@ route('POST', '/api/auth/password', 'user', async ({ db, account, body, secret }
 
 route('GET', '/api/app', 'user', async ({ db, account }) => {
   const settings = await getSettings(db);
-  const statuses = await blockStatuses(db, account.id);
-  const counts = Object.fromEntries((await db.all(`
-    SELECT b.id, (SELECT COUNT(*) FROM lessons WHERE block_id = b.id) AS lessons,
-                 (SELECT COUNT(*) FROM questions WHERE block_id = b.id) AS questions FROM blocks b`)).map(r => [r.id, r]));
-  // Записи справочников приходят отдельно и частями (/api/references/...) — так главный ответ остаётся маленьким
-  const cats = await db.all(`
-    SELECT c.id, c.title, c.icon, (SELECT COUNT(*) FROM ref_items WHERE category_id = c.id) AS count
-    FROM ref_categories c ORDER BY c.sort, c.id`);
-  const history = await db.all(`
-    SELECT id, block_id, block_title, correct, total, percent, passed, finished_at
-    FROM attempts WHERE user_id = ? AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 30`, account.id);
+  const [statuses, countRows, cats, history, completed] = await Promise.all([
+    blockStatuses(db, account.id, settings),
+    db.all(`
+      SELECT b.id, (SELECT COUNT(*) FROM lessons WHERE block_id = b.id) AS lessons,
+                   (SELECT COUNT(*) FROM questions WHERE block_id = b.id) AS questions FROM blocks b`),
+    // Записи справочников приходят отдельно и частями (/api/references/...) — так главный ответ остаётся маленьким
+    db.all(`
+      SELECT c.id, c.title, c.icon, (SELECT COUNT(*) FROM ref_items WHERE category_id = c.id) AS count
+      FROM ref_categories c ORDER BY c.sort, c.id`),
+    db.all(`
+      SELECT id, block_id, block_title, correct, total, percent, passed, finished_at
+      FROM attempts WHERE user_id = ? AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 30`, account.id),
+    db.first('SELECT MAX(finished_at) AS t FROM attempts WHERE user_id = ? AND passed = 1', account.id)
+  ]);
+  const counts = Object.fromEntries(countRows.map(r => [r.id, r]));
   const allPassed = statuses.length && statuses.every(s => s.status === 'passed');
   return {
     settings: pick(settings, ['app_title', 'welcome_text', 'certificate_title', 'certificate_text', 'certificate_signature']),
@@ -279,7 +298,7 @@ route('GET', '/api/app', 'user', async ({ db, account }) => {
     blocks: statuses.map(({ block: b, status, best, attempts }) => ({
       ...pick(b, BLOCK_PUBLIC), lessons: counts[b.id].lessons, questions: counts[b.id].questions, status, best, attempts
     })),
-    completedAt: allPassed ? (await db.first('SELECT MAX(finished_at) AS t FROM attempts WHERE user_id = ? AND passed = 1', account.id)).t : null,
+    completedAt: allPassed ? completed.t : null,
     references: cats,
     history
   };
@@ -396,20 +415,38 @@ route('GET', '/img/:key', null, async ({ env, params }) => {
 const STAFF = "role != 'admin'";
 
 route('GET', '/api/admin/stats', 'manager', async ({ db }) => {
-  const blocks = await publishedBlocks(db);
-  const users = await db.all(`SELECT id FROM accounts WHERE ${STAFF}`);
+  // Все запросы независимы — отправляем разом, а не по очереди
+  const [blocks, users, passedRows, fin, weekRow, act, nu, bsRows, hardest, recent] = await Promise.all([
+    publishedBlocks(db),
+    db.all(`SELECT id FROM accounts WHERE ${STAFF}`),
+    db.all('SELECT DISTINCT user_id, block_id FROM attempts WHERE passed = 1'),
+    db.first('SELECT AVG(percent) AS avg, AVG(passed) AS rate FROM attempts WHERE finished_at IS NOT NULL'),
+    db.first("SELECT COUNT(*) AS n FROM attempts WHERE finished_at >= datetime('now', '-7 days')"),
+    db.all(`SELECT date(finished_at) AS d, COUNT(*) AS attempts, SUM(passed) AS passed
+      FROM attempts WHERE finished_at >= date('now', '-29 days') GROUP BY d`),
+    db.all(`SELECT date(created_at) AS d, COUNT(*) AS n FROM accounts WHERE created_at >= date('now', '-29 days') GROUP BY d`),
+    db.all(`
+      SELECT block_id, COUNT(DISTINCT user_id) AS started, COUNT(*) AS attempts, AVG(percent) AS avg,
+             COUNT(DISTINCT CASE WHEN passed = 1 THEN user_id END) AS passed
+      FROM attempts WHERE finished_at IS NOT NULL GROUP BY block_id`),
+    db.all(`
+      SELECT aa.question_id, MAX(aa.question_text) AS text, MAX(a.block_title) AS block_title,
+             COUNT(*) AS answers, SUM(1 - aa.is_correct) AS wrong
+      FROM attempt_answers aa JOIN attempts a ON a.id = aa.attempt_id
+      WHERE a.finished_at IS NOT NULL GROUP BY aa.question_id HAVING wrong > 0
+      ORDER BY CAST(wrong AS REAL) / COUNT(*) DESC, COUNT(*) DESC LIMIT 6`),
+    db.all(`
+      SELECT a.*, u.name, u.login, u.position
+      FROM attempts a JOIN accounts u ON u.id = a.user_id
+      WHERE a.finished_at IS NOT NULL ORDER BY a.finished_at DESC LIMIT 8`)
+  ]);
   const staff = new Set(users.map(u => u.id));
   const passedByUser = {};
-  for (const r of await db.all('SELECT DISTINCT user_id, block_id FROM attempts WHERE passed = 1')) {
+  for (const r of passedRows) {
     if (staff.has(r.user_id)) (passedByUser[r.user_id] ||= new Set()).add(r.block_id);
   }
   const completed = users.filter(u => blocks.length && blocks.every(b => passedByUser[u.id]?.has(b.id))).length;
-  const fin = await db.first('SELECT AVG(percent) AS avg, AVG(passed) AS rate FROM attempts WHERE finished_at IS NOT NULL');
-  const week = (await db.first("SELECT COUNT(*) AS n FROM attempts WHERE finished_at >= datetime('now', '-7 days')")).n;
-
-  const act = await db.all(`SELECT date(finished_at) AS d, COUNT(*) AS attempts, SUM(passed) AS passed
-    FROM attempts WHERE finished_at >= date('now', '-29 days') GROUP BY d`);
-  const nu = await db.all(`SELECT date(created_at) AS d, COUNT(*) AS n FROM accounts WHERE created_at >= date('now', '-29 days') GROUP BY d`);
+  const week = weekRow.n;
   const activity = [];
   for (let i = 29; i >= 0; i--) {
     const d = new Date(Date.now() - i * 86400e3).toISOString().slice(0, 10);
@@ -417,10 +454,7 @@ route('GET', '/api/admin/stats', 'manager', async ({ db }) => {
     activity.push({ date: d, attempts: a?.attempts || 0, passed: a?.passed || 0, new_users: nu.find(r => r.d === d)?.n || 0 });
   }
 
-  const bs = Object.fromEntries((await db.all(`
-    SELECT block_id, COUNT(DISTINCT user_id) AS started, COUNT(*) AS attempts, AVG(percent) AS avg,
-           COUNT(DISTINCT CASE WHEN passed = 1 THEN user_id END) AS passed
-    FROM attempts WHERE finished_at IS NOT NULL GROUP BY block_id`)).map(r => [r.block_id, r]));
+  const bs = Object.fromEntries(bsRows.map(r => [r.block_id, r]));
 
   return {
     totals: {
@@ -436,16 +470,8 @@ route('GET', '/api/admin/stats', 'manager', async ({ db }) => {
       const s = bs[b.id] || { started: 0, attempts: 0, avg: null, passed: 0 };
       return { id: b.id, title: b.title, icon: b.icon, started: s.started, attempts: s.attempts, passed: s.passed, avg: s.avg == null ? null : Math.round(s.avg) };
     }),
-    hardest: await db.all(`
-      SELECT aa.question_id, MAX(aa.question_text) AS text, MAX(a.block_title) AS block_title,
-             COUNT(*) AS answers, SUM(1 - aa.is_correct) AS wrong
-      FROM attempt_answers aa JOIN attempts a ON a.id = aa.attempt_id
-      WHERE a.finished_at IS NOT NULL GROUP BY aa.question_id HAVING wrong > 0
-      ORDER BY CAST(wrong AS REAL) / COUNT(*) DESC, COUNT(*) DESC LIMIT 6`),
-    recent: await db.all(`
-      SELECT a.*, u.name, u.login, u.position
-      FROM attempts a JOIN accounts u ON u.id = a.user_id
-      WHERE a.finished_at IS NOT NULL ORDER BY a.finished_at DESC LIMIT 8`)
+    hardest,
+    recent
   };
 });
 
@@ -460,9 +486,12 @@ async function bestByUser(db) {
 const ACCOUNT_ADMIN_VIEW = 'id, login, name, role, position, note, created_at, last_seen, must_change_password';
 
 route('GET', '/api/admin/users', 'manager', async ({ db }) => {
-  const blocks = await publishedBlocks(db);
-  const best = await bestByUser(db);
-  const users = (await db.all(`SELECT ${ACCOUNT_ADMIN_VIEW} FROM accounts ORDER BY COALESCE(last_seen, created_at) DESC`)).map(u => {
+  const [blocks, best, accounts] = await Promise.all([
+    publishedBlocks(db),
+    bestByUser(db),
+    db.all(`SELECT ${ACCOUNT_ADMIN_VIEW} FROM accounts ORDER BY COALESCE(last_seen, created_at) DESC`)
+  ]);
+  const users = accounts.map(u => {
     const r = best[u.id] || {};
     const per = blocks.map(b => ({ id: b.id, best: r[b.id]?.best ?? null, passed: !!r[b.id]?.passed }));
     const tried = per.filter(p => p.best != null);
@@ -506,18 +535,23 @@ route('POST', '/api/admin/users', 'manager', async ({ db, account, body }) => {
 
 route('GET', '/api/admin/users/:id', 'manager', async ({ db, params }) => {
   const user = await loadAccount(db, params.id);
-  const statuses = await blockStatuses(db, user.id);
-  const lessonCounts = Object.fromEntries((await db.all('SELECT block_id, COUNT(*) AS n FROM lessons GROUP BY block_id')).map(r => [r.block_id, r.n]));
-  const viewed = Object.fromEntries((await db.all(`
-    SELECT l.block_id, COUNT(*) AS n FROM lesson_views v JOIN lessons l ON l.id = v.lesson_id
-    WHERE v.user_id = ? GROUP BY l.block_id`, user.id)).map(r => [r.block_id, r.n]));
+  const [statuses, lessonRows, viewedRows, attempts] = await Promise.all([
+    blockStatuses(db, user.id),
+    db.all('SELECT block_id, COUNT(*) AS n FROM lessons GROUP BY block_id'),
+    db.all(`
+      SELECT l.block_id, COUNT(*) AS n FROM lesson_views v JOIN lessons l ON l.id = v.lesson_id
+      WHERE v.user_id = ? GROUP BY l.block_id`, user.id),
+    db.all('SELECT * FROM attempts WHERE user_id = ? AND finished_at IS NOT NULL ORDER BY finished_at DESC', user.id)
+  ]);
+  const lessonCounts = Object.fromEntries(lessonRows.map(r => [r.block_id, r.n]));
+  const viewed = Object.fromEntries(viewedRows.map(r => [r.block_id, r.n]));
   return {
     user: pick(user, ACCOUNT_ADMIN_VIEW.split(', ')),
     blocks: statuses.map(s => ({
       id: s.block.id, title: s.block.title, icon: s.block.icon, status: s.status, best: s.best, attempts: s.attempts,
       lessons_total: lessonCounts[s.block.id] || 0, lessons_viewed: viewed[s.block.id] || 0
     })),
-    attempts: await db.all('SELECT * FROM attempts WHERE user_id = ? AND finished_at IS NOT NULL ORDER BY finished_at DESC', user.id)
+    attempts
   };
 });
 
@@ -858,6 +892,9 @@ async function handle(request, env, ctx) {
     if (url.pathname === '/') return new Response('Yuzhane API is running', { headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
     throw new HttpError(404, 'Not found');
   }
+
+  // Проверка связи — без обращения к базе
+  if (url.pathname === '/api/ping') return r.handler({ query: url.searchParams });
 
   const db = makeDb(env.DB);
   await ensureSeed(db);

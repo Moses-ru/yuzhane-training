@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Проверка связи</title>
+<style>
+  :root { --bg: #f4f2f0; --card: #fff; --text: #241c1d; --muted: #7a6f70; --line: #ebe6e3; --ok: #1f9d55; --bad: #d64545; --warn: #d98a1c; --wine: #722F37; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #141112; --card: #1d191a; --text: #efe9e8; --muted: #a0959a; --line: #2d2729; } }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 20px 16px 40px; line-height: 1.5; }
+  main { max-width: 560px; margin: 0 auto; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  p.sub { color: var(--muted); margin-bottom: 18px; font-size: 14px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; margin-bottom: 16px; }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); font-size: 14px; }
+  .row:last-child { border-bottom: none; }
+  .row span:last-child { font-weight: 600; white-space: nowrap; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); } .muted { color: var(--muted); }
+  .verdict { padding: 16px; font-size: 15px; }
+  .verdict b { display: block; margin-bottom: 6px; font-size: 16px; }
+  button { width: 100%; padding: 13px; border-radius: 12px; border: none; background: var(--wine); color: #fff; font: inherit; font-weight: 600; font-size: 15px; cursor: pointer; }
+  button[disabled] { opacity: .6; }
+  textarea { width: 100%; margin-top: 10px; min-height: 120px; font: 12px ui-monospace, Consolas, monospace; padding: 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Проверка связи</h1>
+  <p class="sub">Откройте эту страницу, когда обучение грузится медленно, и нажмите «Проверить». Результат покажет, где задержка.</p>
+  <div class="card" id="results"></div>
+  <div class="card verdict" id="verdict" hidden></div>
+  <button id="run">Проверить</button>
+  <textarea id="report" readonly hidden></textarea>
+</main>
+<script src="config.js?v=202611061323"></script>
+<script>
+const API = window.APP_CONFIG.API_URL;
+const SITE = location.href.replace(/check\.html.*$/, '');
+const TESTS = [
+  { key: 'site', name: 'Сайт (GitHub Pages)', url: () => SITE + 'app.css?nocache=' + Date.now() },
+  { key: 'api', name: 'Сервер — короткий ответ', url: () => API + '/api/ping?kb=0&n=' + Date.now(), repeat: 3 },
+  { key: 'db', name: 'Сервер — база данных', url: () => API + '/api/config?n=' + Date.now() },
+  { key: 'big', name: 'Сервер — 64 КБ данных', url: () => API + '/api/ping?kb=64&n=' + Date.now(), repeat: 2 }
+];
+
+async function timed(url, timeoutMs = 20000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const t0 = performance.now();
+  try {
+    const res = await fetch(url, { cache: 'no-store', signal: ctrl.signal });
+    const size = (await res.arrayBuffer()).byteLength;
+    return { ms: Math.round(performance.now() - t0), ok: res.ok, size };
+  } catch (e) {
+    return { ms: Math.round(performance.now() - t0), ok: false, error: ctrl.signal.aborted ? 'таймаут 20 с' : 'ошибка сети' };
+  } finally { clearTimeout(timer); }
+}
+
+const fmt = r => r.ok ? `${(r.ms / 1000).toFixed(2)} с` : r.error || 'ошибка';
+const cls = r => !r.ok ? 'bad' : r.ms > 3000 ? 'bad' : r.ms > 1200 ? 'warn' : 'ok';
+
+document.getElementById('run').onclick = async () => {
+  const btn = document.getElementById('run');
+  btn.disabled = true;
+  btn.textContent = 'Проверяю…';
+  const box = document.getElementById('results');
+  box.innerHTML = '';
+  const out = {};
+  for (const t of TESTS) {
+    out[t.key] = [];
+    for (let i = 0; i < (t.repeat || 1); i++) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = `<span>${t.name}${t.repeat ? ` · ${i + 1}` : ''}</span><span class="muted">…</span>`;
+      box.appendChild(row);
+      const r = await timed(t.url());
+      out[t.key].push(r);
+      row.lastElementChild.className = cls(r);
+      row.lastElementChild.textContent = fmt(r);
+    }
+  }
+
+  const bad = rs => rs.some(r => !r.ok || r.ms > 3000);
+  let title, text;
+  if (bad(out.site) && !bad(out.api)) {
+    title = 'Медленно открывается GitHub';
+    text = 'Сервер отвечает нормально, а файлы сайта с github.io — нет. Помогает повторное открытие: со второго раза страница берётся из кэша.';
+  } else if (!bad(out.api) && bad(out.big)) {
+    title = 'Провайдер ограничивает Cloudflare';
+    text = 'Короткие ответы проходят, а длинные зависают — так выглядит ограничение трафика к Cloudflare у провайдера. Нужно переносить сервер к другому хостингу.';
+  } else if (bad(out.api)) {
+    title = 'Нет связи с сервером';
+    text = 'Сервер на Cloudflare не отвечает из этой сети. Попробуйте другую сеть (Wi-Fi ↔ мобильный интернет) и пришлите отчёт ниже.';
+  } else if (bad(out.db)) {
+    title = 'Медленно отвечает база данных';
+    text = 'Связь в порядке, но сервер долго отвечает. Пришлите отчёт ниже разработчику.';
+  } else {
+    title = 'Связь в порядке';
+    text = 'Сейчас всё отвечает быстро. Если обучение всё равно висит — обновите страницу с очисткой кэша (Ctrl+F5) и пришлите отчёт ниже.';
+  }
+  const v = document.getElementById('verdict');
+  v.hidden = false;
+  v.innerHTML = `<b>${title}</b>${text}`;
+
+  const report = document.getElementById('report');
+  report.hidden = false;
+  report.value = `Проверка связи ${new Date().toLocaleString('ru-RU')}\n${navigator.userAgent}\n` +
+    TESTS.map(t => `${t.name}: ${out[t.key].map(fmt).join(', ')}`).join('\n') + `\nИтог: ${title}`;
+  btn.disabled = false;
+  btn.textContent = 'Проверить ещё раз';
+};
+</script>
+</body>
+</html>
