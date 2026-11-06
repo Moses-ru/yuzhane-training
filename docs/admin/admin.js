@@ -42,11 +42,31 @@ const session = {
   }
 };
 
+// Плохая сеть: зависший запрос обрываем по таймауту (вместе с чтением ответа), GET повторяем до двух раз
+async function fetchWithRetry(url, init = {}) {
+  const method = (init.method || 'GET').toUpperCase();
+  const tries = method === 'GET' ? 3 : 1;
+  for (let attempt = 1; ; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), method === 'GET' ? 12000 : 20000);
+    try {
+      const res = await fetch(url, { ...init, signal: ctrl.signal });
+      const body = await res.blob();
+      return new Response(res.status === 204 ? null : body, { status: res.status, headers: res.headers });
+    } catch {
+      if (attempt >= tries) throw new Error('Нет связи с сервером — проверьте интернет и попробуйте ещё раз');
+      await new Promise(r => setTimeout(r, 800 * attempt));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
 async function api(path, { method = 'GET', body, raw } = {}) {
   const headers = { Authorization: `Bearer ${session.get() || ''}` };
   if (body && !(body instanceof FormData)) headers['Content-Type'] = 'application/json';
   const base = path.startsWith('/auth') ? '/api' : '/api/admin';
-  const res = await fetch(`${API}${base}${path}`, {
+  const res = await fetchWithRetry(`${API}${base}${path}`, {
     method, headers, body: body instanceof FormData ? body : body ? JSON.stringify(body) : undefined
   });
   if (res.status === 401 && !path.startsWith('/auth/login')) {
@@ -923,6 +943,7 @@ pages.refs = async () => {
   const cats = await api('/refs');
   if (!cats.some(c => c.id === refCat)) refCat = cats[0]?.id ?? null;
   const cat = cats.find(c => c.id === refCat);
+  if (cat) cat.items = await api(`/ref-categories/${cat.id}/items`);
   view().innerHTML = `
     <div class="page-head"><div><h1>Справочники</h1><p>Меню, винная карта, аллергены — всё, что сотрудник может быстро найти</p></div>
       <div class="actions"><button class="btn btn-primary" id="addCat"><i class="fas fa-plus"></i> Раздел</button></div></div>
@@ -930,7 +951,7 @@ pages.refs = async () => {
       <div class="card"><div class="list" id="catList">${cats.map(c => `
         <div class="list-item cat-item ${c.id === refCat ? 'active' : ''}" data-id="${c.id}">
           <span class="handle"><i class="fas fa-grip-vertical"></i></span>
-          <span style="font-size:18px">${esc(c.icon)}</span><b>${esc(c.title)}</b><span class="muted small">${c.items.length}</span>
+          <span style="font-size:18px">${esc(c.icon)}</span><b>${esc(c.title)}</b><span class="muted small">${c.count}</span>
         </div>`).join('') || empty('book-open', 'Нет разделов')}</div></div>
       <div class="card">${cat ? `
         <div class="card-head"><h3>${esc(cat.icon)} ${esc(cat.title)}</h3>
@@ -941,10 +962,10 @@ pages.refs = async () => {
           </div></div>
         <div class="toolbar"><div class="search"><i class="fas fa-search"></i><input type="search" id="itemQ" placeholder="Поиск в разделе"></div></div>
         <div class="list" id="itemList">${cat.items.map(i => `
-          <div class="list-item" data-id="${i.id}" data-search="${esc((i.title + ' ' + i.body).toLowerCase())}">
+          <div class="list-item" data-id="${i.id}" data-search="${esc((i.title + ' ' + i.preview).toLowerCase())}">
             <span class="handle"><i class="fas fa-grip-vertical"></i></span>
             ${i.image ? `<img class="thumb" src="${esc(i.image)}" alt="">` : ''}
-            <div class="list-main"><b>${esc(i.title)}</b><div class="desc">${esc(i.body)}</div></div>
+            <div class="list-main"><b>${esc(i.title)}</b><div class="desc">${esc(i.preview)}</div></div>
             <div class="list-actions">
               <button class="icon-btn" data-edit="${i.id}"><i class="fas fa-pen"></i></button>
               <button class="icon-btn danger" data-del="${i.id}"><i class="fas fa-trash"></i></button>
@@ -988,7 +1009,9 @@ pages.refs = async () => {
     try { await api(`/ref-categories/${cat.id}`, { method: 'DELETE' }); refCat = null; pages.refs(); } catch (e) { fail(e); }
   };
   $('#addItem').onclick = () => itemModal();
-  $$('#itemList [data-edit]').forEach(b => (b.onclick = () => itemModal(cat.items.find(i => i.id === Number(b.dataset.edit)))));
+  $$('#itemList [data-edit]').forEach(b => (b.onclick = async () => {
+    try { itemModal(await api(`/ref-items/${b.dataset.edit}`)); } catch (e) { fail(e); }
+  }));
   $$('#itemList [data-del]').forEach(b => (b.onclick = async () => {
     if (!(await confirmDialog('Удалить запись?'))) return;
     try { await api(`/ref-items/${b.dataset.del}`, { method: 'DELETE' }); pages.refs(); } catch (e) { fail(e); }

@@ -1,6 +1,6 @@
 // Кэш приложения: со второго открытия страница показывается сразу,
 // даже если github.io отвечает медленно.
-const CACHE = 'yuzhane-v1';
+const CACHE = 'yuzhane-v2';
 const NETWORK_TIMEOUT = 2500;
 
 self.addEventListener('install', () => self.skipWaiting());
@@ -16,12 +16,7 @@ async function putInCache(req, res) {
   return res;
 }
 
-// Иконки и шрифты не меняются — берём из кэша
-async function cacheFirst(req) {
-  return (await caches.match(req)) || putInCache(req, await fetch(req));
-}
-
-// Код приложения: свежая версия, если сеть успевает; иначе — из кэша
+// Свежая версия, если сеть успевает ответить; иначе — из кэша
 async function networkFirst(req) {
   const network = fetch(req).then(res => putInCache(req, res));
   const cached = await caches.match(req, { ignoreSearch: req.mode === 'navigate' });
@@ -33,7 +28,7 @@ async function networkFirst(req) {
 self.addEventListener('fetch', e => {
   const req = e.request;
   const url = new URL(req.url);
-  // API и сторонние сайты (Telegram, Cloudflare) не трогаем
+  // API на Cloudflare не кэшируем — только файлы самого сайта
   if (req.method !== 'GET' || url.origin !== self.location.origin) return;
-  e.respondWith(url.pathname.includes('/vendor/') ? cacheFirst(req) : networkFirst(req));
+  e.respondWith(networkFirst(req));
 });

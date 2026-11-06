@@ -264,8 +264,10 @@ route('GET', '/api/app', 'user', async ({ db, account }) => {
   const counts = Object.fromEntries((await db.all(`
     SELECT b.id, (SELECT COUNT(*) FROM lessons WHERE block_id = b.id) AS lessons,
                  (SELECT COUNT(*) FROM questions WHERE block_id = b.id) AS questions FROM blocks b`)).map(r => [r.id, r]));
-  const cats = await db.all('SELECT * FROM ref_categories ORDER BY sort, id');
-  const items = await db.all('SELECT id, category_id, title, body, image FROM ref_items ORDER BY sort, id');
+  // Записи справочников приходят отдельно и частями (/api/references/...) — так главный ответ остаётся маленьким
+  const cats = await db.all(`
+    SELECT c.id, c.title, c.icon, (SELECT COUNT(*) FROM ref_items WHERE category_id = c.id) AS count
+    FROM ref_categories c ORDER BY c.sort, c.id`);
   const history = await db.all(`
     SELECT id, block_id, block_title, correct, total, percent, passed, finished_at
     FROM attempts WHERE user_id = ? AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 30`, account.id);
@@ -278,9 +280,32 @@ route('GET', '/api/app', 'user', async ({ db, account }) => {
       ...pick(b, BLOCK_PUBLIC), lessons: counts[b.id].lessons, questions: counts[b.id].questions, status, best, attempts
     })),
     completedAt: allPassed ? (await db.first('SELECT MAX(finished_at) AS t FROM attempts WHERE user_id = ? AND passed = 1', account.id)).t : null,
-    references: cats.map(c => ({ ...c, items: items.filter(i => i.category_id === c.id) })),
+    references: cats,
     history
   };
+});
+
+const REF_PAGE = 40;
+
+// Поиск по всем справочникам. Сравнение в JS: LOWER() в SQLite не понимает кириллицу
+route('GET', '/api/references/search', 'user', async ({ db, query }) => {
+  const q = String(query.get('q') || '').trim().toLowerCase();
+  if (q.length < 2) return { items: [] };
+  const rows = await db.all(`
+    SELECT i.id, i.category_id, i.title, i.body, i.image, c.title AS category_title, c.icon AS category_icon
+    FROM ref_items i JOIN ref_categories c ON c.id = i.category_id ORDER BY c.sort, i.sort, i.id`);
+  const hits = rows.filter(r => `${r.title} ${r.body}`.toLowerCase().includes(q));
+  // Совпадения в названии — выше
+  hits.sort((a, b) => Number(!a.title.toLowerCase().includes(q)) - Number(!b.title.toLowerCase().includes(q)));
+  return { items: hits.slice(0, 30), total: hits.length };
+});
+
+route('GET', '/api/references/:id', 'user', async ({ db, params, query }) => {
+  const offset = Math.max(0, Number(query.get('offset')) || 0);
+  const total = (await db.first('SELECT COUNT(*) AS n FROM ref_items WHERE category_id = ?', Number(params.id))).n;
+  const items = await db.all(
+    `SELECT id, title, body, image FROM ref_items WHERE category_id = ? ORDER BY sort, id LIMIT ${REF_PAGE} OFFSET ${offset}`, Number(params.id));
+  return { items, total, next_offset: offset + items.length < total ? offset + items.length : null };
 });
 
 route('GET', '/api/blocks/:id', 'user', async ({ db, account, params }) => {
@@ -666,10 +691,19 @@ route('DELETE', '/api/admin/questions/:id', 'manager', async ({ db, params }) =>
   return { ok: true };
 });
 
-route('GET', '/api/admin/refs', 'manager', async ({ db }) => {
-  const cats = await db.all('SELECT * FROM ref_categories ORDER BY sort, id');
-  const items = await db.all('SELECT * FROM ref_items ORDER BY sort, id');
-  return cats.map(c => ({ ...c, items: items.filter(i => i.category_id === c.id) }));
+route('GET', '/api/admin/refs', 'manager', ({ db }) => db.all(`
+  SELECT c.*, (SELECT COUNT(*) FROM ref_items WHERE category_id = c.id) AS count
+  FROM ref_categories c ORDER BY c.sort, c.id`));
+
+// Список записей раздела — с началом описания; полный текст отдаётся при открытии записи
+route('GET', '/api/admin/ref-categories/:id/items', 'manager', ({ db, params }) => db.all(`
+  SELECT id, title, substr(body, 1, 80) AS preview, image FROM ref_items
+  WHERE category_id = ? ORDER BY sort, id`, Number(params.id)));
+
+route('GET', '/api/admin/ref-items/:id', 'manager', async ({ db, params }) => {
+  const item = await db.first('SELECT * FROM ref_items WHERE id = ?', Number(params.id));
+  if (!item) throw new HttpError(404, 'Запись не найдена');
+  return item;
 });
 route('POST', '/api/admin/ref-categories', 'manager', async ({ db, body }) => {
   const data = pick(body, CATEGORY_FIELDS);

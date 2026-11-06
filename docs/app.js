@@ -40,10 +40,30 @@ const session = {
   }
 };
 
+// Плохая сеть: зависший запрос обрываем по таймауту (вместе с чтением ответа), GET повторяем до двух раз
+async function fetchWithRetry(url, init = {}) {
+  const method = (init.method || 'GET').toUpperCase();
+  const tries = method === 'GET' ? 3 : 1;
+  for (let attempt = 1; ; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), method === 'GET' ? 12000 : 20000);
+    try {
+      const res = await fetch(url, { ...init, signal: ctrl.signal });
+      const body = await res.blob();
+      return new Response(res.status === 204 ? null : body, { status: res.status, headers: res.headers });
+    } catch {
+      if (attempt >= tries) throw new Error('Нет связи с сервером — проверьте интернет и попробуйте ещё раз');
+      await new Promise(r => setTimeout(r, 800 * attempt));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
 async function api(path, options = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (session.get()) headers.Authorization = `Bearer ${session.get()}`;
-  const res = await fetch(window.APP_CONFIG.API_URL + '/api' + path, {
+  const res = await fetchWithRetry(window.APP_CONFIG.API_URL + '/api' + path, {
     ...options,
     headers: { ...headers, ...options.headers },
     body: options.body ? JSON.stringify(options.body) : undefined
@@ -106,6 +126,7 @@ function switchScreen(id) {
   document.querySelectorAll('.screen').forEach(s => s.classList.toggle('active', s.id === id));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.screen === id));
   document.querySelector('.main-container').scrollTop = 0;
+  if (id === 'referencesScreen' && state) renderReferences();
 }
 document.querySelectorAll('.nav-item').forEach(n => (n.onclick = () => switchScreen(n.dataset.screen)));
 
@@ -232,11 +253,23 @@ function startConfetti() {
 }
 
 // ---------- references ----------
+// Записи грузятся с сервера частями: раздел — по 40 штук, поиск — по всем разделам сразу
+
+const refCache = {};   // id раздела → { items, next_offset, total }
+let refSearchTimer = null;
+let refSearchSeq = 0;
+
+const refItemHtml = i => `
+    <div class="item">
+      <div class="item-key">${esc(i.title)}${i.category_title ? `<small>${esc(i.category_icon)} ${esc(i.category_title)}</small>` : ''}</div>
+      ${i.body ? `<div class="item-value">${formatText(i.body)}</div>` : ''}
+      ${i.image ? `<img src="${esc(i.image)}" alt="" loading="lazy">` : ''}
+    </div>`;
 
 function renderReferences() {
   const cats = state.references;
   if (!refCategory || !cats.some(c => c.id === refCategory)) refCategory = cats[0]?.id ?? null;
-  const query = $('refSearch').value.trim().toLowerCase();
+  const query = $('refSearch').value.trim();
 
   $('refChips').innerHTML = cats.map(c =>
     `<button class="chip ${!query && c.id === refCategory ? 'active' : ''}" data-cat="${c.id}">${esc(c.icon)} ${esc(c.title)}</button>`).join('');
@@ -246,19 +279,53 @@ function renderReferences() {
     renderReferences();
   }));
 
-  // При поиске ищем по всем справочникам сразу
-  const items = query
-    ? cats.flatMap(c => c.items.filter(i => (i.title + ' ' + i.body).toLowerCase().includes(query)).map(i => ({ ...i, cat: c })))
-    : (cats.find(c => c.id === refCategory)?.items || []).map(i => ({ ...i }));
-
-  $('refResults').innerHTML = items.length ? items.slice(0, 100).map(i => `
-    <div class="item">
-      <div class="item-key">${esc(i.title)}${i.cat ? `<small>${esc(i.cat.icon)} ${esc(i.cat.title)}</small>` : ''}</div>
-      ${i.body ? `<div class="item-value">${formatText(i.body)}</div>` : ''}
-      ${i.image ? `<img src="${esc(i.image)}" alt="" loading="lazy">` : ''}
-    </div>`).join('') : `<div class="empty">${cats.length ? 'Ничего не найдено' : 'Справочники пока пусты'}</div>`;
+  if (!cats.length) return ($('refResults').innerHTML = '<div class="empty">Справочники пока пусты</div>');
+  if (query) return;   // результаты поиска рисует searchReferences
+  const page = refCache[refCategory];
+  if (!page) {
+    $('refResults').innerHTML = '<div class="empty"><i class="fas fa-circle-notch fa-spin"></i></div>';
+    // Пока вкладка закрыта, ничего не грузим
+    if ($('referencesScreen').classList.contains('active')) loadRefPage(refCategory);
+    return;
+  }
+  $('refResults').innerHTML = (page.items.length ? page.items.map(refItemHtml).join('') : '<div class="empty">В разделе пока пусто</div>') +
+    (page.next_offset != null ? `<button class="btn btn-secondary" id="refMore">Показать ещё (${page.total - page.items.length})</button>` : '');
+  if ($('refMore')) $('refMore').onclick = () => { $('refMore').disabled = true; loadRefPage(refCategory); };
 }
-$('refSearch').addEventListener('input', renderReferences);
+
+async function loadRefPage(catId) {
+  const page = refCache[catId];
+  try {
+    const r = await api(`/references/${catId}?offset=${page?.next_offset || 0}`);
+    refCache[catId] = { items: [...(page?.items || []), ...r.items], next_offset: r.next_offset, total: r.total };
+  } catch (e) {
+    toast(e.message);
+    if (!page) return ($('refResults').innerHTML = `<div class="empty">Не удалось загрузить. <button class="btn btn-secondary" onclick="renderReferences()">Повторить</button></div>`);
+  }
+  if (catId === refCategory && !$('refSearch').value.trim()) renderReferences();
+}
+
+async function searchReferences() {
+  const query = $('refSearch').value.trim();
+  renderReferences();
+  if (!query) return;
+  if (query.length < 2) return ($('refResults').innerHTML = '<div class="empty">Введите хотя бы 2 буквы</div>');
+  const seq = ++refSearchSeq;
+  $('refResults').innerHTML = '<div class="empty"><i class="fas fa-circle-notch fa-spin"></i></div>';
+  try {
+    const r = await api(`/references/search?q=${encodeURIComponent(query)}`);
+    if (seq !== refSearchSeq) return;   // пришёл ответ на устаревший запрос
+    $('refResults').innerHTML = r.items.length
+      ? r.items.map(refItemHtml).join('') + (r.total > r.items.length ? `<div class="empty">Показаны первые ${r.items.length} из ${r.total} — уточните запрос</div>` : '')
+      : '<div class="empty">Ничего не найдено</div>';
+  } catch (e) {
+    if (seq === refSearchSeq) $('refResults').innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
+}
+$('refSearch').addEventListener('input', () => {
+  clearTimeout(refSearchTimer);
+  refSearchTimer = setTimeout(searchReferences, 350);
+});
 
 // ---------- profile ----------
 
